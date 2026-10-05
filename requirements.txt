@@ -1,0 +1,3 @@
+ctrader-open-api
+python-dotenv
+requests

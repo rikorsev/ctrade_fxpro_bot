@@ -36,23 +36,43 @@ pip install -r requirements.txt
 
 ## 4. Configure
 
+Create a `.env` file in the repository root (it is loaded automatically), or export the variables in your shell:
+
 ```bash
-cp .env.example .env
+CTRADER_CLIENT_ID=your-client-id
+CTRADER_CLIENT_SECRET=your-client-secret
+CTRADER_ACCESS_TOKEN=your-access-token
+CTRADER_ACCOUNT_ID=
+CTRADER_SYMBOL=EURUSD
+CTRADER_LIVE=0
 ```
 
-Set `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, and `CTRADER_ACCESS_TOKEN`.
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `CTRADER_CLIENT_ID` | yes | | Open API application client ID |
+| `CTRADER_CLIENT_SECRET` | yes | | Open API application client secret |
+| `CTRADER_ACCESS_TOKEN` | yes | | OAuth access token |
+| `CTRADER_ACCOUNT_ID` | no | first account for the token | cTID trader account ID |
+| `CTRADER_SYMBOL` | no | `EURUSD` | Symbol to subscribe to (case-insensitive) |
+| `CTRADER_LIVE` | no | `0` | `1` connects to the live host; anything else uses demo |
 
 Keep `CTRADER_LIVE=0`.
-
-If `CTRADER_ACCOUNT_ID` is empty, the application selects the first account returned for the access token.
 
 ## 5. Run
 
 ```bash
-PYTHONPATH=src python -m fxpro_bot
+python main.py
 ```
 
-You should see account information followed by live EURUSD bid/ask updates.
+You should see the authentication steps and the selected account, followed by live bid/ask updates for the configured symbol. Stop with `Ctrl+C`.
+
+## Project layout
+
+```text
+main.py       entry point: loads config, prints quotes, runs the Twisted reactor
+config.py     reads and validates environment variables
+ctrader.py    CTraderClient: Open API connection, auth flow, symbol lookup, spot subscription
+```
 
 ## Architecture
 
@@ -69,6 +89,8 @@ FxPro cTrader account
 ```
 
 The broker/API layer is intentionally isolated so strategy code can later be tested without connecting to the broker.
+
+Currently only the cTrader client layer exists; the strategy and broker interface layers are planned.
 
 ## Next steps
 

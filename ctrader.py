@@ -13,8 +13,8 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAApplicationAuthRes,
     ProtoOAGetAccountListByAccessTokenReq,
     ProtoOAGetAccountListByAccessTokenRes,
-    ProtoOAGetSymbolsByIdReq,
-    ProtoOAGetSymbolsByIdRes,
+    ProtoOASymbolsListReq,
+    ProtoOASymbolsListRes,
     ProtoOASpotEvent,
     ProtoOASubscribeSpotsReq,
 )
@@ -116,30 +116,26 @@ class CTraderClient:
             self._request_symbols()
             return
 
-        if payload_type == ProtoOAGetSymbolsByIdRes().payloadType:
+        if payload_type == ProtoOASymbolsListRes().payloadType:
             response = Protobuf.extract(message)
 
             for symbol in response.symbol:
                 name = getattr(symbol, "symbolName", "")
+
                 self.symbol_name_by_id[int(symbol.symbolId)] = name
 
                 if name.upper() == self.symbol_name.upper():
                     self.symbol_id = int(symbol.symbolId)
-                    self.symbol_digits = int(symbol.digits)
+
                     print(
-                        f"Found {name}: symbol_id={self.symbol_id}, "
-                        f"digits={self.symbol_digits}"
+                        f"Found {name}: "
+                        f"symbol_id={self.symbol_id}"
                     )
+
                     self._subscribe()
                     return
 
-            available = ", ".join(
-                sorted(self.symbol_name_by_id.values())[:30]
-            )
-            raise RuntimeError(
-                f"Symbol {self.symbol_name!r} not found. "
-                f"First available symbols: {available}"
-            )
+            print(f"Symbol {self.symbol_name!r} not found.")
 
         if payload_type == ProtoOASpotEvent().payloadType:
             event = Protobuf.extract(message)
@@ -170,7 +166,7 @@ class CTraderClient:
         d.addErrback(self._on_error)
 
     def _request_symbols(self) -> None:
-        request = ProtoOAGetSymbolsByIdReq()
+        request = ProtoOASymbolsListReq()
         request.ctidTraderAccountId = self.account_id
 
         d = self.client.send(request)

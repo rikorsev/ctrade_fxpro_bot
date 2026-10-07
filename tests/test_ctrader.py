@@ -4,12 +4,16 @@ from datetime import datetime, timezone
 import pytest
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+    ProtoOAAccountAuthRes,
+    ProtoOAApplicationAuthRes,
     ProtoOAErrorRes,
     ProtoOAExecutionEvent,
+    ProtoOAGetAccountListByAccessTokenRes,
     ProtoOAReconcileRes,
     ProtoOATraderRes,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+    ProtoOACtidTraderAccount,
     ProtoOALightSymbol,
     ProtoOAOrder,
     ProtoOAPosition,
@@ -42,11 +46,46 @@ class FakeTransport:
         return d
 
 
-def make_client(live=False) -> tuple[CTraderClient, FakeTransport]:
-    client = CTraderClient("id", "secret", "token", 123, live)
+def make_client(live=False, account_id=123) -> tuple[CTraderClient, FakeTransport]:
+    client = CTraderClient("id", "secret", "token", account_id, live)
     transport = FakeTransport()
     client.client = transport
     return client, transport
+
+
+def account_list(scope: int) -> ProtoOAGetAccountListByAccessTokenRes:
+    return ProtoOAGetAccountListByAccessTokenRes(accessToken="token", permissionScope=scope, ctidTraderAccount=[
+        ProtoOACtidTraderAccount(ctidTraderAccountId=50, isLive=True),
+        ProtoOACtidTraderAccount(ctidTraderAccountId=49, isLive=False),
+    ])
+
+
+def authenticate(client, transport, responses):
+    """Run the auth flow, answering each request in turn; returns the flow's Deferred."""
+    d = defer.ensureDeferred(client._authenticate())
+    for i, response in enumerate(responses):
+        transport.sent[i][1].callback(wrap(response))
+    return d
+
+
+def test_auth_picks_demo_account_and_detects_view_only_scope():
+    client, transport = make_client(account_id=None)
+    ready = []
+    client.on_ready(ready.append)
+    authenticate(client, transport, [ProtoOAApplicationAuthRes(), account_list(scope=0),
+                                     ProtoOAAccountAuthRes(ctidTraderAccountId=49)])
+    assert client.account_id == 49 and client.can_trade is False and ready == [client]
+    sent_before = len(transport.sent)
+    failures = []
+    client.market_order(symbol_id=1, buy=True, volume=100_000, relative_stop_loss=100).addErrback(failures.append)
+    assert failures[0].value.code == "NO_TRADING_SCOPE" and len(transport.sent) == sent_before
+
+
+def test_auth_rejects_an_account_the_token_does_not_cover():
+    client, transport = make_client(account_id=50)  # 50 is a live account; this client is on the demo host
+    failures = []
+    authenticate(client, transport, [ProtoOAApplicationAuthRes(), account_list(scope=1)]).addErrback(failures.append)
+    assert failures[0].value.code == "NO_ACCOUNT" and client.can_trade is True
 
 
 def test_decode_trendbar_and_unit_conversions():

@@ -10,6 +10,8 @@ Order sending is **demo-only by design**, enforced in two places:
 - `main.py trade` exits when `CTRADER_LIVE=1`;
 - `CTraderClient` refuses `market_order`, `close_position` and `amend_position_sltp` on the live host.
 
+The client also refuses orders when the access token's `permissionScope` is view-only, and `trade --execute` then exits with status 1. Orders need a token issued with the `trading` scope.
+
 Keep both guards. Don't add a live-trading path unless the user explicitly asks.
 
 `docs/RESEARCH.md` is the research report behind the strategies. Its conclusion is that none of them has a reliable edge on FX majors at retail costs today. Keep the code, README and report consistent with that. Don't present strategies as profitable.
@@ -73,6 +75,7 @@ The layering is strategy → planner/risk → broker interface → cTrader clien
 
 - `ctrader.py`: `CTraderClient`.
   - Authentication runs as an async flow on every (re)connect, then the `on_ready` callbacks run.
+  - The flow always fetches the token's account list. This records `can_trade` from `permissionScope`, and checks that a configured `CTRADER_ACCOUNT_ID` belongs to the token and to the host's live/demo kind.
   - `request()` returns a Deferred of the decoded payload. Responses are matched by `clientMsgId`, which the library handles. Error payloads raise `CTraderError`.
   - `_on_message` handles only unsolicited events: spots, execution events, disconnects.
   - `market_order()` resolves when the matching `ORDER_FILLED` execution event arrives, keyed by `clientOrderId`.

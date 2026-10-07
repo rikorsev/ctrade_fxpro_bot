@@ -32,6 +32,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOATraderReq,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+    ProtoOAClientPermissionScope,
     ProtoOAExecutionType,
     ProtoOAOrderType,
     ProtoOATradeSide,
@@ -65,6 +66,7 @@ _DEAD = {
     ProtoOAExecutionType.Value("ORDER_CANCELLED"),
     ProtoOAExecutionType.Value("ORDER_EXPIRED"),
 }
+_SCOPE_TRADE = ProtoOAClientPermissionScope.Value("SCOPE_TRADE")
 
 
 class CTraderError(Exception):
@@ -103,6 +105,7 @@ class CTraderClient:
         self.on_spot = on_spot
         self.on_fatal = on_fatal
         self.ready = False
+        self.can_trade: bool | None = None  # from the access token's scope; None until known
 
         host = EndPoints.PROTOBUF_LIVE_HOST if live else EndPoints.PROTOBUF_DEMO_HOST
         self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
@@ -134,15 +137,25 @@ class CTraderClient:
         await self.request(ProtoOAApplicationAuthReq(clientId=self.client_id, clientSecret=self.client_secret))
         log.info("Application authenticated")
 
+        response = await self.request(ProtoOAGetAccountListByAccessTokenReq(accessToken=self.access_token))
+        if response.HasField("permissionScope"):
+            self.can_trade = response.permissionScope == _SCOPE_TRADE
+            if self.can_trade:
+                log.info("Access token scope: trading")
+            else:
+                log.warning("Access token scope: view only. Quotes and data work, but orders will be refused; "
+                            "generate a token with the 'trading' scope to trade")
+        # Demo accounts can only be used on the demo host and live ones on the live host.
+        kind = "live" if self.live else "demo"
+        accounts = [int(a.ctidTraderAccountId) for a in response.ctidTraderAccount if bool(a.isLive) == self.live]
         if self.account_id is None:
-            response = await self.request(ProtoOAGetAccountListByAccessTokenReq(accessToken=self.access_token))
-            # Demo accounts can only be used on the demo host and live ones on the live host.
-            accounts = [a for a in response.ctidTraderAccount if bool(a.isLive) == self.live]
             if not accounts:
-                kind = "live" if self.live else "demo"
                 raise CTraderError("NO_ACCOUNT", f"no {kind} trading account is authorized for this access token")
-            self.account_id = int(accounts[0].ctidTraderAccountId)
+            self.account_id = accounts[0]
             log.info("Selected account ID: %s", self.account_id)
+        elif self.account_id not in accounts:
+            raise CTraderError("NO_ACCOUNT", f"account {self.account_id} is not a {kind} account authorized for this "
+                                             "access token")
 
         await self.request(
             ProtoOAAccountAuthReq(ctidTraderAccountId=self.account_id, accessToken=self.access_token)
@@ -289,10 +302,14 @@ class CTraderClient:
 
     # -- trading (demo accounts only) ---------------------------------------
 
-    def _refuse_live(self) -> defer.Deferred | None:
+    def _trading_blocked(self) -> defer.Deferred | None:
         if self.live:
             return defer.fail(
                 CTraderError("LIVE_TRADING_DISABLED", "this bot only sends orders to demo accounts (CTRADER_LIVE=0)")
+            )
+        if self.can_trade is False:
+            return defer.fail(
+                CTraderError("NO_TRADING_SCOPE", "the access token was issued without the 'trading' scope")
             )
         return None
 
@@ -312,7 +329,7 @@ class CTraderClient:
         ``volume`` is in hundredths of a unit; relative stops are in 1/100000
         of a price unit, as the protocol requires for market orders.
         """
-        refused = self._refuse_live()
+        refused = self._trading_blocked()
         if refused is not None:
             return refused
         client_order_id = uuid.uuid4().hex[:24]
@@ -350,13 +367,13 @@ class CTraderClient:
         return result
 
     def close_position(self, position_id: int, volume: int) -> defer.Deferred:
-        refused = self._refuse_live()
+        refused = self._trading_blocked()
         if refused is not None:
             return refused
         return self._account_request(ProtoOAClosePositionReq, positionId=position_id, volume=volume)
 
     def amend_position_sltp(self, position_id: int, stop_loss: float, take_profit: float | None) -> defer.Deferred:
-        refused = self._refuse_live()
+        refused = self._trading_blocked()
         if refused is not None:
             return refused
         fields: dict[str, Any] = dict(positionId=position_id, stopLoss=stop_loss)

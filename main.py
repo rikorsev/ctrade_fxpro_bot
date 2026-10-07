@@ -34,7 +34,6 @@ def main(argv: list[str] | None = None) -> None:
 
 def cmd_quotes(args: argparse.Namespace) -> None:
     """Stream bid/ask for one symbol (the original behaviour of this bot)."""
-    from twisted.internet import reactor
 
     from ctrader import CTraderClient
 
@@ -72,12 +71,11 @@ def cmd_quotes(args: argparse.Namespace) -> None:
 
     client.on_ready(subscribe)
     client.start()
-    reactor.run()
+    _run_reactor()
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
     """Download history and contract specs from cTrader for backtesting."""
-    from twisted.internet import reactor
 
     from ctrader import CTraderClient
     from ctrader_broker import CTraderBroker
@@ -110,17 +108,19 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             log.info("Contract specs (digits, volumes, swaps) saved to %s", Path(args.data) / SPECS_FILE)
         except Exception:
             log.exception("Fetch failed")
+            _FAILURES.append("fetch failed")
         finally:
+            client.stop()
             _stop_reactor()
 
     client.on_ready(run)
     client.start()
-    reactor.run()
+    _run_reactor()
 
 
 def cmd_trade(args: argparse.Namespace) -> None:
     """Run strategies against the demo account (dry run unless --execute)."""
-    from twisted.internet import defer, reactor, task
+    from twisted.internet import defer, task
 
     from ctrader import CTraderClient
     from ctrader_broker import CTraderBroker
@@ -157,22 +157,40 @@ def cmd_trade(args: argparse.Namespace) -> None:
         lambda f: log.error("Trading cycle failed: %s", f.getTraceback())))
 
     async def on_ready(_: CTraderClient) -> None:
+        if args.execute and client.can_trade is False:
+            client.stop()
+            _stop_reactor("This access token only has the 'accounts' (view) scope, so orders would be refused. "
+                          "Generate a token with the 'trading' scope, or run without --execute for a dry run.")
+            return
         await broker.load(symbols)
         if not loop.running:
             loop.start(args.poll, now=True)
 
     client.on_ready(on_ready)
     client.start()
-    reactor.run()
+    _run_reactor()
+
+
+_FAILURES: list[str] = []
 
 
 def _stop_reactor(reason: str | None = None) -> None:
+    """Stop the reactor. Passing a reason marks the run as failed (non-zero exit status)."""
     from twisted.internet import reactor
 
     if reason:
         log.error(reason)
+        _FAILURES.append(reason)
     if reactor.running:
         reactor.stop()
+
+
+def _run_reactor() -> None:
+    from twisted.internet import reactor
+
+    reactor.run()
+    if _FAILURES:
+        sys.exit(1)
 
 
 # -- offline commands ----------------------------------------------------------

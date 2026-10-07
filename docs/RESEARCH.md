@@ -8,7 +8,7 @@ October 2026. Scope: systematic strategies that a retail bot can run on an FxPro
 2. **This conclusion rests on independent evidence, not one backtest:**
    - published out-of-sample studies (Neely, Weller & Ulrich 2009; Hsu, Taylor & Wang 2016; Hurst, Ooi & Pedersen 2017);
    - a textbook replication I ran without the backtester (12-month FX momentum: Sharpe 0.36 to 0.71 in every decade from the 1970s to the 2000s, then −0.15 in both the 2010s and the 2020s);
-   - the bot's own engine on two independent datasets, 55 years of FRED closes and 22 years of OHLC bars;
+   - the bot's own engine on two independent datasets, 55 years of FRED closes and 22 years of OHLC bars, plus a cross-check on FxPro's own cTrader history and swap rates;
    - a random-entry control that the main trend strategy could not beat.
 3. **What the bot ships with:** three strategies with the strongest evidence, implemented carefully:
    - `donchian`: Turtle-style channel breakout;
@@ -45,7 +45,7 @@ The free Yahoo data contains off-market ticks: EURUSD at 1.49 instead of 1.29 on
   - commission of $35 per $1M per side;
   - padded raw spreads (EURUSD 0.5 pip, GBPUSD 0.9, USDJPY 0.7, others 0.7 to 1.8);
   - 0.1 pip slippage;
-  - swaps equal to the historical interest-rate differential minus a 1% per year broker markup, with a triple charge on Wednesday.
+  - swaps equal to the historical interest-rate differential minus a 1% per year broker markup, with a triple charge on Wednesday. FxPro's real swap rates imply a median markup of 1.2% (§4.7).
 - A USD 100,000 account risking 0.5% of equity per trade, with all the portfolio limits described in §5.
 - The sticky 20% drawdown kill switch is disabled in research runs (it would simply end the test). The tables report when it would have fired.
 
@@ -211,6 +211,16 @@ No parameter choice rescues trend following on FX majors in this period, so ther
 - Monthly rebalancing cuts TSMOM turnover by 4.7× for the same result, so it is the default.
 - The carry filters cut the maximum drawdown from 22.9% to 8.4% and lifted the long-run Sharpe from 0.11 to 0.49. That is what the crash-risk literature predicts, and it is why they are on by default.
 
+### 4.7 Cross-check on FxPro's own data (demo account, 7 October 2026)
+
+The bot was run against a real FxPro cTrader demo account: quotes, `fetch` of D1 history and contract specs, backtests and a live dry run.
+
+- **Backtests on cTrader's own D1 bars**, 10 pairs, 2008 to 2026, with today's FxPro swap rates applied to the whole history: donchian Sharpe −0.23 (58% max DD), tsmom −0.31 (44%), carry +0.29 (7.4%). This independent data source agrees with §4.1. Carry looks a little better here partly because today's swaps are applied to the past, which knows the current carry direction in advance.
+- **Live spreads** at the time were 0.4 pip on EURUSD and 0.3 pip on USDJPY, below the 0.5 and 0.7 pips modelled. The cost model is conservative on spreads.
+- **Real swap markup.** The account's `swapLong`/`swapShort`, compared with the latest short-term rate differentials, imply a markup of **1.2% per side (median; mean 1.5%, range 0.1 to 3.8%)**. It is asymmetric: the negative-carry side of high-differential pairs (short USDJPY, short USDCHF, short EURJPY) costs 3 to 4% a year more than the differential. The 1% markup used in this research is, if anything, slightly favourable to the strategies.
+- **Pairs that earn real carry** after the markup, at today's rates: only long AUDJPY (2.5% a year), long USDCHF (1.8%) and long USDJPY (1.6%) exceed the strategy's 1% threshold. On the dry run, `carry` wanted long USDCHF; AUDJPY and USDJPY failed the trend filter.
+- **Account size matters.** The minimum order is 1,000 units. With a daily ATR stop, the minimum position already risks about $14 to $19, so a $1,000 balance cannot follow a 0.5% risk-per-trade rule, and the risk manager skips every entry. Prudent sizing on majors needs roughly $10,000 or more.
+
 ---
 
 ## 5. Risk management the bot enforces
@@ -255,6 +265,7 @@ All of these were verified against the installed `ctrader-open-api` 0.9.2 protob
 
 - **Rate limits:** 50 requests per second for non-historical data and 5 per second for historical data, per connection. The Python library throttles everything to 5 messages per second.
 - **Trendbars:**
+  - FxPro's D1 bars start at 21:00 UTC in summer (the New York close), so the bar labelled "Sunday 21:00" is Monday's full session. Weekend merging only folds genuine stubs (bars closing before Monday midday UTC), so these bars are kept intact.
   - `ProtoOAGetTrendbarsReq` needs `fromTimestamp` (required in this protocol version).
   - At most 14,000 bars come back per request, with no "has more" flag, so `fetch` requests chunks of 5,000 bars.
   - Prices are `low` plus unsigned deltas, in 1/100000 units.
@@ -265,6 +276,7 @@ All of these were verified against the installed `ctrader-open-api` 0.9.2 protob
   - Fills arrive as `ProtoOAExecutionEvent` (`ORDER_ACCEPTED`, then `ORDER_FILLED`). Errors arrive as `ProtoOAOrderErrorEvent` or `ProtoOAErrorRes`.
 - **Responses are matched to requests by `clientMsgId`**, which the library supports. The client resolves each request's Deferred and raises `CTraderError` on error responses.
 - **Access tokens expire after 30 days** (`expiresIn` 2,628,000 s). Refresh tokens do not expire until used. Token refresh is not implemented yet; when the token expires the bot logs a fatal authentication error and stops.
+- **Token scope.** A token issued with the `accounts` scope can read quotes, history and positions, but the server rejects orders ("TRADE permission required"). `ProtoOAGetAccountListByAccessTokenRes.permissionScope` reports the scope; the client logs it at login and refuses orders, and `trade --execute` refuses to start, when it is view-only. Orders need a token issued with the `trading` scope.
 
 ---
 

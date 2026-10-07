@@ -24,6 +24,8 @@ For a real OAuth application, configure a redirect URI and obtain an access toke
 For initial personal testing, cTrader also provides a Playground from the Applications page.
 Access tokens expire after 30 days; generate a new one when the bot reports an authentication error.
 
+Choose the **trading** scope when you generate the token (with the OAuth URL, `scope=trading`). A token with the `accounts` (view) scope works for quotes, `fetch`, backtests and dry runs. The server rejects its orders, though, so `trade --execute` refuses to start with one. The bot logs the token's scope at every login.
+
 ## 3. Create the virtual environment
 
 ```bash
@@ -98,7 +100,13 @@ python main.py trade --strategy carry                 # dry run: logs decisions,
 python main.py trade --strategy carry --execute       # sends orders to the demo account
 ```
 
-The bot checks for a newly closed bar every minute and runs the strategies once per bar. Every entry is a market order with a broker-side stop. Its other behaviour:
+The bot checks for a newly closed bar every minute and runs the strategies once per bar. FxPro's daily bars close at 21:00 UTC in summer (the New York close). Every entry is a market order with a broker-side stop.
+
+Position size comes from the risk per trade, and the smallest order is 1,000 units. With daily stops that minimum already risks about $15 to $20, so on a $1,000 demo balance at 0.5% risk every entry is skipped as "size below broker minimum". Use a demo balance of about $10,000 or more.
+
+`tsmom` only changes positions on the first daily bar of a month, so after a mid-month start it waits for the next month.
+
+Its other behaviour:
 - Decisions, orders and errors go to `logs/journal.jsonl`.
 - Progress and kill-switch state are kept in `state/live_state.json`, so a restart neither repeats a bar nor forgets a halt.
 - The bot only manages positions labelled `fxbot:<strategy>`; manual trades on the account are left alone.

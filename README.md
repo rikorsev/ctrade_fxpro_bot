@@ -1,21 +1,18 @@
-# FxPro cTrader Open API starter bot
+# FxPro cTrader Open API bot
 
-Linux/Python starter application for an FxPro cTrader account.
+Linux/Python bot for an FxPro cTrader account. It can:
+- stream live bid/ask quotes and spreads;
+- download history and contract specs (digits, volumes, swap rates) from cTrader;
+- backtest evidence-based FX strategies with realistic costs, swaps and risk limits;
+- run the same strategies against a **demo** account, as a dry run or sending orders.
 
-This first version is intentionally READ-ONLY:
-- connects to cTrader Open API
-- authenticates the application
-- authenticates a cTrader trading account
-- retrieves symbols
-- finds a configured symbol
-- subscribes to live bid/ask quotes
-- prints quotes
+> **Read [docs/RESEARCH.md](docs/RESEARCH.md) before trading anything.** The research reviews the academic evidence and tests every strategy on 22 to 55 years of data. Its conclusion: no strategy here can be expected to make money on FX majors at retail costs today. Trend following and carry worked for decades, but their edge in developed currencies has decayed to about zero since around 2010, and broker financing costs turn that into a loss. Use the bot as a research and learning tool on demo.
 
-No order-placement code is included yet.
+Order sending is **demo-only**. The `trade` command refuses to start with `CTRADER_LIVE=1`, and the client rejects order requests on the live host.
 
 ## 1. Create a cTrader account
 
-You need an FxPro cTrader account (demo is recommended for development).
+You need an FxPro cTrader account. Use a demo account: the bot only trades demo.
 
 ## 2. Register a cTrader Open API application
 
@@ -25,18 +22,19 @@ Register an application in the cTrader Open API portal and obtain:
 
 For a real OAuth application, configure a redirect URI and obtain an access token.
 For initial personal testing, cTrader also provides a Playground from the Applications page.
+Access tokens expire after 30 days; generate a new one when the bot reports an authentication error.
 
 ## 3. Create the virtual environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt        # or requirements-dev.txt to also install pytest
 ```
 
 ## 4. Configure
 
-Create a `.env` file in the repository root (it is loaded automatically), or export the variables in your shell:
+Copy `.env.example` to `.env` in the repository root (it is loaded automatically and is gitignored), or export the variables in your shell:
 
 ```bash
 CTRADER_CLIENT_ID=your-client-id
@@ -44,6 +42,7 @@ CTRADER_CLIENT_SECRET=your-client-secret
 CTRADER_ACCESS_TOKEN=your-access-token
 CTRADER_ACCOUNT_ID=
 CTRADER_SYMBOL=EURUSD
+CTRADER_SYMBOLS=EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,USDCAD,USDCHF
 CTRADER_LIVE=0
 ```
 
@@ -52,52 +51,138 @@ CTRADER_LIVE=0
 | `CTRADER_CLIENT_ID` | yes | | Open API application client ID |
 | `CTRADER_CLIENT_SECRET` | yes | | Open API application client secret |
 | `CTRADER_ACCESS_TOKEN` | yes | | OAuth access token |
-| `CTRADER_ACCOUNT_ID` | no | first account for the token | cTID trader account ID |
-| `CTRADER_SYMBOL` | no | `EURUSD` | Symbol to subscribe to (case-insensitive) |
-| `CTRADER_LIVE` | no | `0` | `1` connects to the live host; anything else uses demo |
+| `CTRADER_ACCOUNT_ID` | no | first demo account for the token | cTID trader account ID |
+| `CTRADER_SYMBOL` | no | `EURUSD` | Symbol for the quote stream (case-insensitive) |
+| `CTRADER_SYMBOLS` | no | `CTRADER_SYMBOL` | Comma-separated default symbols for `fetch`, `backtest`, `sweep` and `trade` |
+| `CTRADER_LIVE` | no | `0` | `1` connects to the live host (quotes and data only; trading refuses to run) |
 
 Keep `CTRADER_LIVE=0`.
 
 ## 5. Run
 
 ```bash
-python main.py
+python main.py                       # stream quotes for CTRADER_SYMBOL, with the spread in pips
+python main.py quotes --symbol GBPUSD
 ```
 
-You should see the authentication steps and the selected account, followed by live bid/ask updates for the configured symbol. Stop with `Ctrl+C`.
+### Download data
+
+```bash
+python main.py fetch --timeframe D1 --years 15      # writes data/<SYMBOL>_D1.csv and data/symbols.json
+```
+
+`symbols.json` holds each symbol's digits, volume limits and the account's current swap rates.
+
+### Backtest
+
+```bash
+python main.py backtest --strategy carry
+python main.py backtest --strategy donchian --strategy carry --start 2015-01-01 --trades-csv trades.csv
+python main.py backtest --strategy donchian --param entry=100 --param exit=20 --cost-multiplier 2
+```
+
+Signals fill at the next bar's open, and costs include spread, slippage and commission ($35 per $1M per side). With `--swaps broker`, today's swap rates from `symbols.json` are applied to the whole history, which is only a rough guide for carry. Crosses such as EURGBP need a conversion pair (for example GBPUSD) in the data directory.
+
+### Parameter sweep
+
+```bash
+python main.py sweep --strategy donchian --grid entry=20,55,100 --grid exit=10,20
+```
+
+The sweep prints every configuration and the **Deflated Sharpe Ratio** of the best one: the probability that its edge is real once you account for how many configurations were tried.
+
+### Trade on the demo account
+
+```bash
+python main.py trade --strategy carry                 # dry run: logs decisions, sends nothing
+python main.py trade --strategy carry --execute       # sends orders to the demo account
+```
+
+The bot checks for a newly closed bar every minute and runs the strategies once per bar. Every entry is a market order with a broker-side stop. Its other behaviour:
+- Decisions, orders and errors go to `logs/journal.jsonl`.
+- Progress and kill-switch state are kept in `state/live_state.json`, so a restart neither repeats a bar nor forgets a halt.
+- The bot only manages positions labelled `fxbot:<strategy>`; manual trades on the account are left alone.
+- If a drawdown halt fires, clear it with `--reset-drawdown` once you have decided to continue.
+
+## Strategies
+
+| Name | Idea | Evidence (see docs/RESEARCH.md) | Defaults |
+|---|---|---|---|
+| `donchian` | Turtle-style breakout: enter on a close beyond the 55-bar high/low; initial stop 2 ATR, then trail the 20-bar channel | Hurst, Ooi & Pedersen 2017; Turtle rules; decayed in FX since the 1990s | `entry=55 exit=20 atr=20 stop_atr=2` |
+| `tsmom` | Time-series momentum: majority vote of the 3, 6 and 12-month return signs, acted on monthly; 3-ATR disaster stop | Moskowitz, Ooi & Pedersen 2012; short lookbacks decayed most | `fast=63 medium=126 slow=252 stop_atr=3 rebalance=monthly` |
+| `carry` | Hold the side that earns positive swap (net of the broker's markup) only while price is above/below its 100-bar SMA and volatility is not spiking | Lustig et al. 2011; Brunnermeier et al. 2008; Menkhoff et al. 2012 | `min_carry=1.0 trend=100 vol_cap=1.5 stop_atr=3` |
+
+Results on 10 pairs over 2005 to 2026, with costs: donchian Sharpe −0.18, tsmom −0.10, carry +0.15 (8% max drawdown). Full tables are in the research report.
+
+## Risk controls
+
+These limits are enforced identically in backtests and live (`trading/risk.py`), and each can be set on the command line:
+- 0.5% of equity at risk per trade (position size = risk / stop distance);
+- at most 3% total open risk;
+- at most 1.5% risk per currency and direction;
+- 10× leverage cap;
+- daily-loss halt at 3%;
+- sticky drawdown halt at 20%;
+- a protective stop on every position.
+
+## Research
+
+```bash
+python -m research.download          # free data from FRED and Yahoo into data/research/
+python -m research.run_research      # regenerates data/research/results.md (about 5 minutes)
+```
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The tests cover indicators, strategies, risk limits, costs and swaps, the backtester's fills and stops, metrics, data handling, the live trader (against a fake broker), and the cTrader client and adapter (against real protobuf messages with a fake transport).
 
 ## Project layout
 
 ```text
-main.py       entry point: loads config, prints quotes, runs the Twisted reactor
-config.py     reads and validates environment variables
-ctrader.py    CTraderClient: Open API connection, auth flow, symbol lookup, spot subscription
+main.py              CLI: quotes (default), fetch, backtest, sweep, trade
+config.py            reads and validates environment variables
+ctrader.py           CTraderClient: connection, auth, typed Deferred-based requests, demo-only order methods
+ctrader_broker.py    CTraderBroker: implements trading.broker.Broker on top of CTraderClient
+trading/
+  models.py          Bar, SymbolSpec, Position, Signal, AccountState
+  indicators.py      SMA, EMA, ATR, Donchian channel, RSI, Bollinger, volatility
+  strategies/        donchian, tsmom (trend.py), carry (carry.py); base class and registry
+  planner.py         signal + current position -> close / entry / stop-update actions
+  risk.py            sizing, exposure caps, daily-loss and drawdown kill switches
+  costs.py           spreads, commission, swaps, rollover counting, currency conversion
+  backtest.py        event-driven backtester (shares strategies, planner and risk with live)
+  metrics.py         CAGR, Sharpe, drawdowns, trade stats, probabilistic and deflated Sharpe
+  data.py            CSV bars, symbols.json, weekend-bar merging, resampling
+  broker.py          Broker protocol the live trader depends on
+  live.py            LiveTrader: polls for closed bars, decides, sizes, executes or dry-runs, journals
+research/            data download, research-only strategies, experiment runner
+docs/RESEARCH.md     the research report
+tests/               pytest suite
 ```
 
 ## Architecture
 
 ```text
-strategy
-   |
-broker interface
-   |
-cTrader client
-   |
-Spotware cTrader Open API
-   |
-FxPro cTrader account
+strategy (trading/strategies)  ->  planner + risk manager  ->  broker interface (trading/broker.py)
+                                                                   |                      |
+                                                     backtester (simulated fills)   CTraderBroker
+                                                                                          |
+                                                                                    CTraderClient
+                                                                                          |
+                                                                               Spotware cTrader Open API
+                                                                                          |
+                                                                               FxPro cTrader demo account
 ```
 
-The broker/API layer is intentionally isolated so strategy code can later be tested without connecting to the broker.
-
-Currently only the cTrader client layer exists; the strategy and broker interface layers are planned.
+Strategies, the planner and the risk manager are pure Python. The backtester and the live trader drive the same code, so a backtest exercises exactly the decisions and limits the bot applies live.
 
 ## Next steps
 
-1. OAuth authorization-code flow with a local callback.
-2. Token persistence and refresh.
-3. Historical bars.
-4. Position/order read API.
-5. Demo-only order execution.
-6. Risk manager.
-7. Strategy/backtesting layer.
+1. OAuth authorization-code flow with a local callback, plus token persistence and refresh. Access tokens currently expire after 30 days.
+2. Multi-asset research (indices, metals, energies), where the trend-following evidence is stronger than in FX alone.
+3. Compare months of demo results against backtests of the same period before considering anything else.

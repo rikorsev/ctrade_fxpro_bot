@@ -1,2 +1,11 @@
 .venv/*
 __pycache__/
+.pytest_cache/
+
+# credentials
+.env
+
+# downloaded market data, bot state and logs
+data/
+state/
+logs/

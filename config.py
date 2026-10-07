@@ -12,6 +12,7 @@ class Config:
     account_id: int | None
     live: bool
     symbol: str
+    symbols: tuple[str, ...]
 
 
 def load_config() -> Config:
@@ -46,4 +47,12 @@ def load_config() -> Config:
         account_id=account_id,
         live=live,
         symbol=symbol,
+        symbols=default_symbols(),
     )
+
+
+def default_symbols() -> tuple[str, ...]:
+    """CTRADER_SYMBOLS (comma-separated), falling back to CTRADER_SYMBOL."""
+    load_dotenv()
+    raw = os.getenv("CTRADER_SYMBOLS", "").strip() or os.getenv("CTRADER_SYMBOL", "EURUSD").strip()
+    return tuple(s.strip().upper() for s in raw.split(",") if s.strip())

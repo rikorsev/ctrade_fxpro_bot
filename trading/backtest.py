@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from trading.costs import BrokerSwaps, CostModel, CurrencyConverter, SwapCarry, SwapModel, rollovers
-from trading.models import LONG, Bar, Position, SymbolSpec, timeframe_delta
+from trading.models import LONG, Bar, BarWindow, Position, SymbolSpec, timeframe_delta
 from trading.planner import CloseIntent, EntryIntent, StopUpdate, plan_actions
 from trading.risk import Exposure, RiskConfig, RiskManager, position_exposure
 from trading.strategies import MarketContext, Strategy
@@ -111,6 +111,8 @@ class Backtester:
         if len(set(names)) != len(names):
             raise ValueError("strategies must have distinct names")
         self.strategies = list(strategies)
+        for strategy in self.strategies:
+            strategy.check_timeframe(timeframe)
         self.bars = {s: list(b) for s, b in bars.items()}
         self.timeframe = timeframe
         self.bar_length = timeframe_delta(timeframe)
@@ -118,6 +120,12 @@ class Backtester:
         missing = [s for s in self.symbols if s not in self.bars]
         if missing:
             raise ValueError(f"no bars for {', '.join(missing)}")
+        for strategy in self.strategies:
+            for symbol in self.symbols:
+                try:
+                    strategy.check_symbol(symbol)
+                except ValueError as exc:
+                    raise ValueError(f"{strategy.name} cannot trade {symbol}: {exc}") from None
         specs = dict(specs or {})
         self.specs = {s: specs.get(s) or SymbolSpec.infer(s) for s in self.symbols}
         self.costs = costs or CostModel()
@@ -196,7 +204,7 @@ class Backtester:
             key = (strategy.name, symbol)
             held = self._open.get(key)
             position = held.position if held else None
-            window = series[i + 1 - strategy.lookback:i + 1]
+            window = BarWindow(series, i + 1 - strategy.lookback, i + 1)
             signal = strategy.on_bar(symbol, window, position, context)
             for action in plan_actions(strategy.name, symbol, signal, position):
                 if isinstance(action, StopUpdate):
@@ -258,7 +266,7 @@ class Backtester:
     def _open_position(self, key: tuple[str, str], pending: _PendingEntry, bar: Bar) -> None:
         intent = pending.intent
         spec = self.specs[intent.symbol]
-        spread, slip = self.costs.spread(spec), self.costs.slippage(spec)
+        spread, slip = self.costs.spread(spec, bar.open), self.costs.slippage(spec, bar.open)
         price = bar.open + spread + slip if intent.direction == LONG else bar.open - slip
         stop = spec.round_price(price - intent.direction * intent.stop_distance)
         take_profit = None
@@ -282,7 +290,7 @@ class Backtester:
         for key in [k for k in self._open if k[1] == symbol]:
             held = self._open[key]
             p = held.position
-            spread, slip = self.costs.spread(held.spec), self.costs.slippage(held.spec)
+            spread, slip = self.costs.spread(held.spec, bar.open), self.costs.slippage(held.spec, bar.open)
             if p.direction == LONG:
                 if p.stop_loss is not None and bar.low <= p.stop_loss:
                     self._close(key, min(bar.open, p.stop_loss) - slip, bar.time, "stop")
@@ -296,7 +304,7 @@ class Backtester:
                     self._close(key, min(ask_open, p.take_profit), bar.time, "take profit")
 
     def _exit_price(self, held: _Open, bid: float) -> float:
-        spread, slip = self.costs.spread(held.spec), self.costs.slippage(held.spec)
+        spread, slip = self.costs.spread(held.spec, bid), self.costs.slippage(held.spec, bid)
         return bid - slip if held.position.direction == LONG else bid + spread + slip
 
     def _close(self, key: tuple[str, str], price: float, when: datetime, reason: str) -> None:
@@ -337,7 +345,7 @@ class Backtester:
 
     def _commission(self, spec: SymbolSpec, units: float, price: float) -> float:
         usd_notional = units * price * self.converter.rate(spec.quote, "USD")
-        usd = usd_notional * self.costs.commission_per_million / 1_000_000
+        usd = usd_notional * self.costs.commission_rate(spec) / 1_000_000
         return usd * self.converter.rate("USD", self.account_currency)
 
     def _accrue_swaps(self, symbol: str, until: datetime, only: _Open | None = None) -> None:
@@ -359,7 +367,7 @@ class Backtester:
         for held in self._open.values():
             p, spec = held.position, held.spec
             bid = self._last_close[spec.name]
-            mark = bid if p.direction == LONG else bid + self.costs.spread(spec)
+            mark = bid if p.direction == LONG else bid + self.costs.spread(spec, bid)
             rate = self.converter.rate(spec.quote, self.account_currency)
             equity += (mark - p.entry_price) * p.direction * p.units * rate + held.swap
         return equity

@@ -60,8 +60,19 @@ def test_currency_converter():
 
 def test_cost_model():
     costs = CostModel(spread_pips={"EURUSD": 0.4}, default_spread_pips=2.0, slippage_pips=0.1)
-    assert costs.spread(SymbolSpec.infer("EURUSD")) == pytest.approx(0.00004)
-    assert costs.spread(SymbolSpec.infer("USDJPY")) == pytest.approx(0.02)
+    assert costs.spread(SymbolSpec.infer("EURUSD"), 1.1) == pytest.approx(0.00004)
+    assert costs.spread(SymbolSpec.infer("USDJPY"), 150.0) == pytest.approx(0.02)
     double = costs.scaled(2)
-    assert double.spread(SymbolSpec.infer("EURUSD")) == pytest.approx(0.00008)
+    assert double.spread(SymbolSpec.infer("EURUSD"), 1.1) == pytest.approx(0.00008)
     assert double.commission_per_million == 70.0
+
+
+def test_cfd_costs_scale_with_price_and_pay_no_commission():
+    costs = CostModel(spread_bp={"#USSPX500": 1.0}, slippage_bp={"#USSPX500": 0.5})
+    index = SymbolSpec.infer("#USSPX500")
+    assert costs.spread(index, 5000.0) == pytest.approx(0.5)
+    assert costs.spread(index, 2000.0) == pytest.approx(0.2)
+    assert costs.slippage(index, 5000.0) == pytest.approx(0.25)
+    assert costs.commission_rate(index) == 0.0
+    assert costs.commission_rate(SymbolSpec.infer("XAUUSD")) == 35.0
+    assert costs.scaled(2).spread(index, 5000.0) == pytest.approx(1.0)

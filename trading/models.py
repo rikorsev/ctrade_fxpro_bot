@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -45,6 +46,58 @@ class Bar:
     low: float
     close: float
     volume: float = 0.0
+
+
+class BarWindow(Sequence[Bar]):
+    """A read-only view of ``bars[start:stop]`` that is free to create.
+
+    The backtester hands strategies one of these on every bar instead of
+    copying thousands of intraday bars into a new list each time. Slicing it
+    returns a plain list.
+    """
+
+    __slots__ = ("_bars", "_start", "_stop")
+
+    def __init__(self, bars: list[Bar], start: int, stop: int) -> None:
+        self._bars = bars
+        self._start = max(start, 0)
+        self._stop = min(stop, len(bars))
+
+    def __len__(self) -> int:
+        return max(self._stop - self._start, 0)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            r = range(len(self))[index]
+            if r.step == 1:
+                return self._bars[self._start + r.start:self._start + r.stop]
+            return [self._bars[self._start + i] for i in r]
+        n = len(self)
+        if index < 0:
+            index += n
+        if not 0 <= index < n:
+            raise IndexError("bar window index out of range")
+        return self._bars[self._start + index]
+
+    def __iter__(self) -> Iterator[Bar]:
+        return map(self._bars.__getitem__, range(self._start, self._stop))
+
+    def __reversed__(self) -> Iterator[Bar]:
+        return map(self._bars.__getitem__, range(self._stop - 1, self._start - 1, -1))
+
+
+# Approximate FxPro cTrader contract details for common CFDs, so backtests on
+# downloaded research data work before `fetch` has saved the real ones.
+# Swaps are % of notional per year; intraday strategies never pay them.
+KNOWN_CFDS = {
+    "#USSPX500": dict(base="USSPX500", quote="USD", swap_long=-6.2, swap_short=1.1),
+    "#USNDAQ100": dict(base="USNDAQ100", quote="USD", swap_long=-6.0, swap_short=1.1),
+    "#US30": dict(base="US30", quote="USD", swap_long=-6.5, swap_short=1.1),
+    "#GERMANY40": dict(base="GERMANY40", quote="EUR", swap_long=-5.0, swap_short=-0.4),
+    "#UK100": dict(base="UK100", quote="GBP", swap_long=-6.5, swap_short=1.2),
+    "XAUUSD": dict(base="XAU", quote="USD", swap_long=-6.1, swap_short=1.5, pip_position=1, lot_size=100.0,
+                   min_volume=1.0, volume_step=1.0),
+}
 
 
 @dataclass(frozen=True)
@@ -95,8 +148,13 @@ class SymbolSpec:
 
     @classmethod
     def infer(cls, name: str) -> SymbolSpec:
-        """Default spec for a plain six-letter FX pair such as EURUSD or USDJPY."""
+        """Default spec for a plain six-letter FX pair such as EURUSD, or for a CFD in ``KNOWN_CFDS``."""
         name = name.upper()
+        if name in KNOWN_CFDS:
+            fields = dict(digits=2, pip_position=0, lot_size=1.0, min_volume=0.01, volume_step=0.01,
+                          swap_type="percent")
+            fields.update(KNOWN_CFDS[name])
+            return cls(name=name, **fields)
         if len(name) != 6 or not name.isalpha():
             raise ValueError(
                 f"Cannot infer contract details for {name!r}; fetch symbol specs from cTrader first"

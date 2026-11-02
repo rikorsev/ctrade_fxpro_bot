@@ -162,7 +162,7 @@ class Summary:
             ("Win rate", f"{self.win_rate:.1%}"),
             ("Profit factor", f"{self.profit_factor:.2f}"),
             ("Avg R per trade", f"{self.avg_r:+.2f}"),
-            ("Avg holding", f"{self.avg_holding_days:.1f} days"),
+            ("Avg holding", holding_time(self.avg_holding_days)),
             ("Commission paid", f"{self.commission:,.0f}"),
             ("Swap earned", f"{self.swap:+,.0f}"),
             ("Risk halts", f"{self.halts}"),
@@ -170,6 +170,12 @@ class Summary:
         ]
         width = max(len(k) for k, _ in rows)
         return "\n".join(f"{k:<{width}}  {v}" for k, v in rows)
+
+
+def holding_time(days: float) -> str:
+    if math.isnan(days):
+        return "n/a"
+    return f"{days * 24:.1f} hours" if days < 2 else f"{days:.1f} days"
 
 
 def summarize(result: BacktestResult) -> Summary:

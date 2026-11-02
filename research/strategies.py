@@ -6,11 +6,14 @@ strategies against (see docs/RESEARCH.md).
 from __future__ import annotations
 
 import random
+import statistics
 from dataclasses import dataclass
+from datetime import timedelta
 
 from trading.indicators import donchian, rsi, sma
 from trading.models import FLAT, LONG, SHORT, Signal
 from trading.strategies.base import Strategy, recent_atr
+from trading.strategies.intraday import IntradayStrategy, OpeningRangeBreakout, OrbParams
 
 
 @dataclass(frozen=True)
@@ -147,3 +150,72 @@ class Rsi2MeanReversion(Strategy):
         held = sum(1 for b in bars if b.time >= position.entry_time)
         done = held >= p.max_hold or (strength > 50 if position.direction == LONG else strength < 50)
         return Signal(FLAT if done else position.direction)
+
+
+@dataclass(frozen=True)
+class RandomOrbParams(OrbParams):
+    seed: int = 0
+
+
+class RandomOrb(OpeningRangeBreakout):
+    """The opening range breakout with a coin flip instead of the first candle's direction.
+
+    Same entry time, stop, target and sizing, so any difference from ``orb``
+    measures what the first candle's direction is worth.
+    """
+
+    name = "random_orb"
+    Params = RandomOrbParams
+
+    def __init__(self, params=None, **overrides) -> None:
+        super().__init__(params, **overrides)
+        self.rng = random.Random(self.params.seed)
+
+    def direction(self, range_open, range_close):
+        if range_close == range_open:
+            return FLAT
+        return self.rng.choice((LONG, SHORT))
+
+
+@dataclass(frozen=True)
+class LateMomentumParams:
+    entry_minutes: int = 30  # enter this long before the close
+    days: int = 14  # sessions of daily volatility for the stop
+    stop_sigma: float = 0.5
+    flat_minutes: int = 5
+    session: str = "auto"
+    timeframe: str = "M5"
+
+
+class LateDayMomentum(IntradayStrategy):
+    """Market intraday momentum (Gao, Han, Li & Zhou 2018; Baltussen et al. 2021).
+
+    Half an hour before the close, take the direction of the return from the
+    previous session's close to now, and hold it until the close.
+    """
+
+    name = "late_momentum"
+    Params = LateMomentumParams
+
+    @property
+    def history_days(self) -> int:  # type: ignore[override]
+        return self.params.days
+
+    def on_bar(self, symbol, bars, position, context):
+        p = self.params
+        today, early = self._housekeeping(symbol, bars, position)
+        if today is None:
+            return early
+        if position is not None or today.end - (bars[-1].time + self._bar) != timedelta(minutes=p.entry_minutes):
+            return None
+        history = self._completed(symbol, bars, today)
+        if len(history) < p.days + 1:
+            return None
+        returns = [b.close / a.close - 1.0 for a, b in zip(history, history[1:])]
+        sigma = statistics.stdev(returns)
+        move = bars[-1].close / history[-1].close - 1.0
+        if move == 0 or sigma <= 0:
+            return Signal(FLAT)
+        direction = LONG if move > 0 else SHORT
+        return Signal(direction, stop_distance=p.stop_sigma * sigma * bars[-1].close,
+                      reason=f"{move:+.2%} since the previous close")

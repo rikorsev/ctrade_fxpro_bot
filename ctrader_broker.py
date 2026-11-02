@@ -90,8 +90,11 @@ class CTraderBroker:
 
     # -- start-up -------------------------------------------------------------
 
-    async def load(self, symbols: Iterable[str]) -> None:
-        """Load account, asset and symbol metadata. Call after every (re)connect."""
+    async def load(self, symbols: Iterable[str]) -> list[str]:
+        """Load account, asset and symbol metadata. Call after every (re)connect.
+
+        Returns the symbols this account does not offer; the others are loaded.
+        """
         self._assets = {int(a.assetId): a.name for a in await self.client.assets()}
         trader = await self.client.trader()
         self.account_currency = self._assets.get(int(trader.depositAssetId), "USD")
@@ -100,13 +103,11 @@ class CTraderBroker:
         self._light = {s.symbolName.upper(): s for s in light if s.symbolName}
         self._names = {int(s.symbolId): name for name, s in self._light.items()}
         names = [s.upper() for s in symbols]
-        missing = [s for s in names if s not in self._light]
-        if missing:
-            raise CTraderError("SYMBOL_NOT_FOUND", f"not offered on this account: {', '.join(missing)}")
         await self._load_specs(names)
         log.info("Account %s: currency %s, balance %.2f, leverage 1:%g", self.client.account_id,
                  self.account_currency, trader.balance / 10 ** self._money_digits,
                  trader.leverageInCents / 100 if trader.HasField("leverageInCents") else 0)
+        return [s for s in names if s not in self._light]
 
     async def _load_specs(self, names: Sequence[str]) -> None:
         wanted = {int(self._light[n].symbolId): n for n in names if n not in self._specs and n in self._light}

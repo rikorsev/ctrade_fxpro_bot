@@ -31,20 +31,60 @@ DEFAULT_SPREADS_PIPS = {
 }
 
 
+# CFD spreads in basis points of price, so that costs scale with the price
+# level across long histories. Measured on an FxPro cTrader demo account in
+# October 2026 (US500 0.9 bp, NAS100 0.3, US30 0.4, GER40 1.0, UK100 1.4,
+# XAUUSD 0.5) and padded upwards.
+DEFAULT_SPREADS_BP = {
+    "#USSPX500": 1.0,
+    "#USNDAQ100": 0.6,
+    "#US30": 0.6,
+    "#GERMANY40": 1.0,
+    "#UK100": 1.5,
+    "XAUUSD": 0.6,
+}
+# Slippage per fill for the same CFDs, in basis points. The live bot sends its
+# market order a few seconds after the bar closes, so breakout entries pay for
+# the price drifting on in the breakout direction.
+DEFAULT_SLIPPAGE_BP = {
+    "#USSPX500": 0.3,
+    "#USNDAQ100": 0.3,
+    "#US30": 0.3,
+    "#GERMANY40": 0.4,
+    "#UK100": 0.5,
+    "XAUUSD": 0.3,
+}
+
+
 @dataclass(frozen=True)
 class CostModel:
-    """Execution costs. The defaults approximate an FxPro cTrader account (see docs/RESEARCH.md)."""
+    """Execution costs. The defaults approximate an FxPro cTrader account (see docs/RESEARCH.md).
+
+    FX pairs are costed in pips; symbols in ``spread_bp`` in basis points of
+    the price. FxPro charges commission on FX and metals but not on index
+    and commodity CFDs (symbols starting with "#").
+    """
 
     spread_pips: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_SPREADS_PIPS))
     default_spread_pips: float = 1.5
     slippage_pips: float = 0.1
     commission_per_million: float = 35.0  # USD per 1M USD of notional, charged on open and on close
+    spread_bp: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_SPREADS_BP))
+    slippage_bp: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_SLIPPAGE_BP))
 
-    def spread(self, spec: SymbolSpec) -> float:
+    def spread(self, spec: SymbolSpec, price: float) -> float:
+        if spec.name in self.spread_bp:
+            return self.spread_bp[spec.name] / 10_000 * price
         return self.spread_pips.get(spec.name, self.default_spread_pips) * spec.pip_size
 
-    def slippage(self, spec: SymbolSpec) -> float:
+    def slippage(self, spec: SymbolSpec, price: float) -> float:
+        if spec.name in self.slippage_bp:
+            return self.slippage_bp[spec.name] / 10_000 * price
         return self.slippage_pips * spec.pip_size
+
+    def commission_rate(self, spec: SymbolSpec) -> float:
+        """USD per 1M USD of notional per side."""
+        return 0.0 if spec.name.startswith("#") else self.commission_per_million
 
     def scaled(self, factor: float) -> CostModel:
         """The same model with spread, slippage and commission multiplied by ``factor``."""
@@ -53,6 +93,8 @@ class CostModel:
             default_spread_pips=self.default_spread_pips * factor,
             slippage_pips=self.slippage_pips * factor,
             commission_per_million=self.commission_per_million * factor,
+            spread_bp={k: v * factor for k, v in self.spread_bp.items()},
+            slippage_bp={k: v * factor for k, v in self.slippage_bp.items()},
         )
 
 

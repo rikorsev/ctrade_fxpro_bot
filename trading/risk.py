@@ -34,6 +34,24 @@ class RiskConfig:
             raise ValueError("max_positions must be >= 1 and max_leverage > 0")
 
 
+# Named presets for the command line (--risk-profile). Individual limits can still be overridden.
+RISK_PROFILES = {
+    "standard": RiskConfig(),
+    # For small accounts that accept large swings: 2% of equity per trade. At this risk the best intraday
+    # backtest fell 51% peak to trough (2014-2017), so the sticky drawdown halt sits at 50%. Even so it
+    # would have fired in May 2017 and needed a human to restart the bot (docs/RESEARCH.md §11).
+    "aggressive": RiskConfig(
+        risk_per_trade=0.02,
+        max_open_risk=0.06,
+        max_currency_risk=0.06,
+        max_positions=6,
+        max_leverage=20.0,  # the EU retail limit for major index CFDs
+        max_daily_loss=0.06,
+        max_drawdown=0.50,
+    ),
+}
+
+
 @dataclass(frozen=True)
 class Exposure:
     """An open (or about to be opened) position as the risk manager sees it, in account currency."""

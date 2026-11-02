@@ -176,6 +176,66 @@ def test_failed_cycle_is_retried_soon(tmp_path):
     assert len(broker.opened) == 1
 
 
+class FailsOnGbp(Scripted):
+    def on_bar(self, symbol, bars, position, context):
+        if symbol == "GBPUSD":
+            raise ZeroDivisionError("bad bar")
+        return super().on_bar(symbol, bars, position, context)
+
+
+def test_a_failing_or_unavailable_symbol_does_not_stop_the_others(tmp_path):
+    broker = FakeBroker({"EURUSD": BARS, "GBPUSD": BARS})
+    s = FailsOnGbp({BARS[-1].time: Signal(LONG, stop_distance=0.01)}, lookback=3)
+    config = LiveConfig(symbols=("EURUSD", "GBPUSD", "USDJPY"), timeframe="D1", execute=True,
+                        state_path=tmp_path / "state.json", journal_path=tmp_path / "journal.jsonl")
+    t = LiveTrader(broker, [s], RiskManager(), config, clock=lambda: BARS[-1].time + timedelta(days=1, minutes=1))
+    t.ignore("usdjpy", "not offered on this account")
+    assert t.symbols == ["EURUSD", "GBPUSD"]
+    assert run(t.tick())
+    assert [o.symbol for o in broker.opened] == ["EURUSD"]
+    events = [(e["event"], e["symbol"]) for e in journal(tmp_path)]
+    assert events == [("symbol_ignored", "USDJPY"), ("signal", "EURUSD"), ("strategy_failed", "GBPUSD"),
+                      ("opened", "EURUSD")]
+    assert set(t.last_bar) == {"EURUSD", "GBPUSD"}  # the failed bar is not retried
+
+
 def test_strategy_names_must_be_distinct(tmp_path):
     with pytest.raises(ValueError):
         LiveTrader(FakeBroker({}), [Scripted({}), Scripted({})], RiskManager(), LiveConfig(symbols=("EURUSD",)))
+
+
+def test_intraday_tick_on_five_minute_bars(tmp_path):
+    from datetime import date
+
+    from tests.helpers import quiet_sessions, session_bars, session_days
+    from trading.strategies import NoiseBreakout
+
+    days = session_days(date(2024, 1, 2), 32)
+    history = quiet_sessions(days[:31])
+    opening = history[-1].close
+    rising = session_bars(days[31], opening, [opening * (1 + 0.001 * (i + 1)) for i in range(6)])
+    broker = FakeBroker({"#USSPX500": history + rising})
+    config = LiveConfig(symbols=("#USSPX500",), timeframe="M5", execute=True,
+                        state_path=tmp_path / "state.json", journal_path=tmp_path / "journal.jsonl")
+    with pytest.raises(ValueError):
+        LiveTrader(broker, [NoiseBreakout(days=3)], RiskManager(), LiveConfig(symbols=("#USSPX500",)))
+    # A symbol without a known session is ignored; the trader only refuses to start if nothing is left.
+    mixed = LiveTrader(broker, [NoiseBreakout(days=3)], RiskManager(),
+                       LiveConfig(symbols=("#USSPX500", "#JP225_Z26"), timeframe="M5"))
+    assert mixed.symbols == ["#USSPX500"]
+    with pytest.raises(ValueError, match="#JP225_Z26"):
+        LiveTrader(broker, [NoiseBreakout(days=3)], RiskManager(), LiveConfig(symbols=("#JP225_Z26",), timeframe="M5"))
+
+    # 25 minutes into the session: between checkpoints, so nothing is journaled.
+    broker.data["#USSPX500"] = history + rising[:5]
+    clock = {"now": rising[4].time + timedelta(minutes=5, seconds=10)}
+    t = LiveTrader(broker, [NoiseBreakout(days=3)], RiskManager(), config, clock=lambda: clock["now"])
+    assert run(t.tick())
+    assert broker.opened == [] and not (tmp_path / "journal.jsonl").exists()
+
+    broker.data["#USSPX500"] = history + rising
+    clock["now"] = rising[5].time + timedelta(minutes=5, seconds=20)  # after the settle delay
+    assert run(t.tick())
+    (order,) = broker.opened
+    assert order.direction == LONG and order.strategy == "noise_breakout"
+    assert [e["event"] for e in journal(tmp_path)] == ["signal", "opened"]

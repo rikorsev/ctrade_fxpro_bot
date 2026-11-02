@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Python bot for an FxPro account via the Spotware cTrader Open API. It streams quotes, downloads history, backtests strategies and runs them against a **demo** account.
+Python bot for an FxPro account via the Spotware cTrader Open API. It streams quotes, downloads history, backtests strategies and runs them against a **demo** account. It has two families of strategies: intraday (day trading on five-minute bars, flat before each session closes) and daily (swing trading on D1 bars).
 
 Order sending is **demo-only by design**, enforced in two places:
 - `main.py trade` exits when `CTRADER_LIVE=1`;
@@ -14,7 +14,7 @@ The client also refuses orders when the access token's `permissionScope` is view
 
 Keep both guards. Don't add a live-trading path unless the user explicitly asks.
 
-`docs/RESEARCH.md` is the research report behind the strategies. Its conclusion is that none of them has a reliable edge on FX majors at retail costs today. Keep the code, README and report consistent with that. Don't present strategies as profitable.
+`docs/RESEARCH.md` is the research report behind the strategies. Part I (daily) concludes that none of the daily strategies has a reliable edge on FX majors at retail costs today. Part II (intraday) finds a real but small intraday momentum effect that survives FxPro's costs only with `noise_breakout` on the Nasdaq 100 CFD. That net result is not statistically reliable and has been weak since the paper was published. Keep the code, README and report consistent with that. Don't present strategies as profitable.
 
 ## Commands
 
@@ -25,6 +25,7 @@ python -m pytest                           # all tests; no broker connection nee
 python main.py                             # quote stream (default command)
 python main.py fetch|backtest|sweep|trade --help
 python -m research.download && python -m research.run_research   # regenerate data/research/results.md
+python -m research.intraday                # regenerate data/research/intraday_results.md (about 30 min)
 ```
 
 There is no linter or build step.
@@ -33,11 +34,11 @@ Configuration comes from environment variables or a `.env` file (gitignored; loa
 - Required: `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, `CTRADER_ACCESS_TOKEN`
 - Optional:
   - `CTRADER_ACCOUNT_ID`: if empty, the first account whose live/demo flag matches the host is used.
-  - `CTRADER_SYMBOL`: default `EURUSD`.
+  - `CTRADER_SYMBOL`: default `EURUSD` (`.env.example` uses `#USNDAQ100`; FxPro index CFD names start with `#`).
   - `CTRADER_SYMBOLS`: comma-separated; defaults to `CTRADER_SYMBOL`.
   - `CTRADER_LIVE`: `1` selects the live host; anything else selects demo.
 
-Backtests and sweeps need no credentials.
+Backtests and sweeps need no credentials. `--timeframe` defaults to the strategy's own (`default_timeframe`: M5 for intraday strategies, D1 for the others), and `--risk-profile standard|aggressive` picks a `RISK_PROFILES` preset whose single limits can still be overridden.
 
 ## Architecture
 
@@ -48,14 +49,17 @@ The layering is strategy → planner/risk → broker interface → cTrader clien
 
 ### `trading/`
 
-- `models.py`: `Bar` (open time, UTC), `SymbolSpec` (volumes in units), `Position`, `Signal`, `AccountState`.
+- `models.py`: `Bar` (open time, UTC), `BarWindow` (zero-copy view the backtester passes to strategies), `SymbolSpec` (volumes in units; `infer` knows FX pairs and the CFDs in `KNOWN_CFDS`), `Position`, `Signal`, `AccountState`.
+- `sessions.py`: exchange sessions (`us`, `eu`, `uk`, `fx`) in local time via `zoneinfo`, so their UTC hours follow each exchange's daylight saving. `session_for(symbol)` infers the session from the symbol name.
 - `strategies/`:
   - `Strategy.on_bar(symbol, bars, position, context) -> Signal | None`. It receives exactly `lookback` *closed* bars.
   - Parameters are frozen dataclasses; CLI overrides are coerced by type.
   - Register new strategies in `STRATEGIES` in `strategies/__init__.py`.
+  - `intraday.py`: `IntradayStrategy` base (session bookkeeping, a per-day cache of completed sessions, flat before the close, closes positions left over from an earlier session), `NoiseBreakout` (`noise_breakout`) and `OpeningRangeBreakout` (`orb`). Their Params carry `timeframe`; `check_timeframe` makes the backtester and live trader refuse a mismatch, and `main.py` injects `--timeframe` via `with_timeframe`. `check_symbol` raises for a symbol with no known session: the backtester refuses it, the live trader ignores it.
 - `planner.plan_actions`: turns a signal plus the current position into `CloseIntent`, `StopUpdate` or `EntryIntent`.
   - Every entry must carry a `stop_distance`.
   - Trailing stops only ever tighten.
+- `risk.RISK_PROFILES`: `standard` (0.5% per trade) and `aggressive` (2% per trade) presets.
 - `risk.RiskManager`:
   - sizes positions as risk ÷ stop distance;
   - enforces open-risk, per-currency, leverage and position caps;
@@ -63,11 +67,13 @@ The layering is strategy → planner/risk → broker interface → cTrader clien
 - `backtest.Backtester`:
   - Signals at a bar's close fill at the next bar's open. Bars are treated as bid.
   - Stops are checked on the high/low, gaps fill at the open, and swaps accrue per rollover (triple Wednesday).
+  - `CostModel` costs FX in pips and the CFDs in `spread_bp`/`slippage_bp` in basis points of price; symbols starting with `#` pay no commission (as at FxPro).
   - Positions still open at the end are closed so they appear in the trade list.
 - `live.LiveTrader`: `tick()` is an `async` method.
   - It fetches bars only when a new bar should have closed, drops the forming bar, and merges D1 weekend stubs.
   - It runs strategies, then executes closes, then stop updates, then entries (sized with fresh equity).
-  - It journals to JSON lines and saves `last_bar` and risk state after each cycle.
+  - It journals to JSON lines and saves `last_bar` and risk state after each cycle. Bars where a strategy returns `None` (no opinion) are logged at DEBUG and not journaled.
+  - One bad symbol never stops the others. Symbols a strategy cannot trade (`check_symbol`) are dropped at construction, and `ignore()` drops those the account does not offer (`CTraderBroker.load` returns them). Both are journaled as `symbol_ignored`. An exception from `on_bar` or the planner skips that strategy/symbol for the bar (`strategy_failed`). A failed bar fetch backs off per symbol. Only account-level failures retry the whole cycle.
   - Without `execute` it is a dry run.
 - `broker.Broker`: the protocol `LiveTrader` uses. Methods return awaitables; `CTraderBroker` returns Deferreds.
 
@@ -103,6 +109,6 @@ Live-trader tests drive `tick()` against an in-memory `FakeBroker`. cTrader test
 
 ## Research
 
-`research/` holds the downloaders (FRED, Yahoo), research-only strategies (`RandomEntry`, `Rsi2MeanReversion`, `DollarCarry`) and `run_research.py`.
+`research/` holds the downloaders (FRED, Yahoo, HistData one-minute bars aggregated to M5), research-only strategies (`RandomEntry`, `Rsi2MeanReversion`, `DollarCarry`, `RandomOrb`, `LateDayMomentum`), `run_research.py` (daily) and `intraday.py` (intraday; runs backtests in worker processes on session-only bars).
 
-Downloaded data and results go to `data/research/`, which is gitignored. If you change strategy defaults, re-run the research and update the tables in `docs/RESEARCH.md`.
+Downloaded data and results go to `data/research/`, which is gitignored. If you change strategy defaults, re-run the research and update the tables in `docs/RESEARCH.md`. The intraday defaults follow the published papers; don't tune them on the backtest.

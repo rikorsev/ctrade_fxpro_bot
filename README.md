@@ -3,10 +3,16 @@
 Linux/Python bot for an FxPro cTrader account. It can:
 - stream live bid/ask quotes and spreads;
 - download history and contract specs (digits, volumes, swap rates) from cTrader;
-- backtest evidence-based FX strategies with realistic costs, swaps and risk limits;
-- run the same strategies against a **demo** account, as a dry run or sending orders.
+- backtest evidence-based strategies with realistic costs, swaps and risk limits:
+  - **day trading** on five-minute bars of index CFDs, flat before every close (`noise_breakout`, `orb`);
+  - swing trading on daily bars of FX pairs (`donchian`, `tsmom`, `carry`);
+- run the same strategies against a **demo** account, as a dry run or sending orders, with a `standard` or an `aggressive` risk profile.
 
-> **Read [docs/RESEARCH.md](docs/RESEARCH.md) before trading anything.** The research reviews the academic evidence and tests every strategy on 22 to 55 years of data. Its conclusion: no strategy here can be expected to make money on FX majors at retail costs today. Trend following and carry worked for decades, but their edge in developed currencies has decayed to about zero since around 2010, and broker financing costs turn that into a loss. Use the bot as a research and learning tool on demo.
+> **Read [docs/RESEARCH.md](docs/RESEARCH.md) before trading anything.** The research reviews the academic evidence and tests every strategy net of FxPro's costs:
+> - **Day trading.** Of 24 intraday strategy and market combinations tested on 2011–2026 five-minute data, only `noise_breakout` (intraday momentum) on the Nasdaq 100 CFD made money after costs: 5% a year at 1% risk per trade, Sharpe 0.40, 24% maximum drawdown. Its edge is small: +1.4 basis points per trade, not statistically reliable, and indistinguishable from luck once picking the best of 24 is accounted for. It breaks even at twice the modelled costs, and it has roughly broken even since the paper behind it appeared in May 2024.
+> - **Swing trading.** No daily strategy can be expected to make money on FX majors at retail costs today.
+>
+> Use the bot on demo as an experiment, not as a source of income.
 
 Order sending is **demo-only**. The `trade` command refuses to start with `CTRADER_LIVE=1`, and the client rejects order requests on the live host.
 
@@ -44,9 +50,11 @@ CTRADER_CLIENT_SECRET=your-client-secret
 CTRADER_ACCESS_TOKEN=your-access-token
 CTRADER_ACCOUNT_ID=
 CTRADER_SYMBOL=EURUSD
-CTRADER_SYMBOLS=EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,USDCAD,USDCHF
+CTRADER_SYMBOLS=#USNDAQ100
 CTRADER_LIVE=0
 ```
+
+FxPro names its index CFDs with a leading `#` (`#USNDAQ100`, `#USSPX500`, `#Germany40`, `#UK100`); symbol names are case-insensitive. `.env` reads `#USNDAQ100` fine, but on the command line quote it: `--symbols '#USNDAQ100'`.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -70,24 +78,34 @@ python main.py quotes --symbol GBPUSD
 ### Download data
 
 ```bash
+python main.py fetch --symbols '#USNDAQ100' --timeframe M5 --years 2    # writes data/#USNDAQ100_M5.csv
 python main.py fetch --timeframe D1 --years 15      # writes data/<SYMBOL>_D1.csv and data/symbols.json
 ```
 
-`symbols.json` holds each symbol's digits, volume limits and the account's current swap rates.
+`symbols.json` holds each symbol's digits, volume limits and the account's current swap rates. Without it, backtests fall back to approximate FxPro specs for FX pairs and the common index CFDs and gold (`KNOWN_CFDS` in `trading/models.py`).
 
 ### Backtest
 
 ```bash
+python main.py backtest --strategy noise_breakout --symbols '#USNDAQ100'
+python main.py backtest --strategy noise_breakout --symbols '#USNDAQ100' --risk-profile aggressive --equity 1000
+python main.py backtest --strategy orb --symbols '#USNDAQ100,#USSPX500' --data data/research/intraday
 python main.py backtest --strategy carry
-python main.py backtest --strategy donchian --strategy carry --start 2015-01-01 --trades-csv trades.csv
 python main.py backtest --strategy donchian --param entry=100 --param exit=20 --cost-multiplier 2
 ```
 
-Signals fill at the next bar's open, and costs include spread, slippage and commission ($35 per $1M per side). With `--swaps broker`, today's swap rates from `symbols.json` are applied to the whole history, which is only a rough guide for carry. Crosses such as EURGBP need a conversion pair (for example GBPUSD) in the data directory.
+The timeframe defaults to the strategy's own: M5 for the intraday strategies, D1 for the daily ones. Signals fill at the next bar's open. Costs include spread, slippage and commission:
+- FX pairs: spreads in pips, plus $35 per $1M per side.
+- Index CFDs and gold: spreads and slippage in basis points of price, measured on an FxPro demo account and padded. Index CFDs pay no commission.
+
+With `--swaps broker`, today's swap rates from `symbols.json` are applied to the whole history; intraday strategies never hold overnight, so they pay none. Crosses such as EURGBP, and the DAX and FTSE CFDs, need a conversion pair (for example EURUSD or GBPUSD) in the data directory.
+
+`data/research/intraday/` (from `python -m research.download --only histdata`) holds 2010–2026 five-minute bars for the Nasdaq 100, S&P 500, DAX, FTSE, gold, EURUSD, GBPUSD and USDJPY. They cover the whole day, so a backtest over all of it takes a few minutes.
 
 ### Parameter sweep
 
 ```bash
+python main.py sweep --strategy noise_breakout --symbols '#USNDAQ100' --grid band=0.75,1,1.25 --grid check=30,60
 python main.py sweep --strategy donchian --grid entry=20,55,100 --grid exit=10,20
 ```
 
@@ -96,23 +114,43 @@ The sweep prints every configuration and the **Deflated Sharpe Ratio** of the be
 ### Trade on the demo account
 
 ```bash
-python main.py trade --strategy carry                 # dry run: logs decisions, sends nothing
-python main.py trade --strategy carry --execute       # sends orders to the demo account
+python main.py trade --strategy noise_breakout --symbols '#USNDAQ100'            # dry run: logs decisions, sends nothing
+python main.py trade --strategy noise_breakout --symbols '#USNDAQ100' --risk-profile aggressive --execute
+python main.py trade --strategy carry --execute                                   # daily strategy
 ```
 
-The bot checks for a newly closed bar every minute and runs the strategies once per bar. FxPro's daily bars close at 21:00 UTC in summer (the New York close). Every entry is a market order with a broker-side stop.
+Every entry is a market order with a broker-side stop. Decisions, orders and errors go to `logs/journal.jsonl`.
 
-Position size comes from the risk per trade, and the smallest order is 1,000 units. With daily stops that minimum already risks about $15 to $20, so on a $1,000 demo balance at 0.5% risk every entry is skipped as "size below broker minimum". Use a demo balance of about $10,000 or more.
+A symbol that cannot be traded does not stop the others. The bot logs a warning, journals `symbol_ignored` and carries on with the rest when a symbol is not offered on the account or a strategy has no trading session for it. It exits only if no symbol is left. If a strategy raises an error on one symbol, that bar is skipped and journaled as `strategy_failed`.
 
-`tsmom` only changes positions on the first daily bar of a month, so after a mid-month start it waits for the next month.
+**Day trading.** With an intraday strategy the bot works on five-minute bars:
+- It checks every 5 seconds and acts about 3 seconds after each bar closes.
+- It trades only during the market's cash session: 09:30 to 16:00 New York time for US indices, 09:00 to 17:30 Frankfurt time for the DAX, 08:00 to 16:30 London time for the FTSE, and 08:00 to 17:00 London time for FX and gold. Daylight saving follows each exchange.
+- `noise_breakout` decides every 30 minutes (10:00, 10:30, … New York time), so most bars produce no log line.
+- Positions are closed 5 minutes before the session ends, so no swap is ever charged. A position that is still open in a later session (after a half-day holiday or a restart) is closed at once.
+- Leave the bot running through the session. If it stops, open positions keep their broker-side stop but miss the session-close exit.
+
+**Daily strategies.** The bot checks for a newly closed bar every minute and runs the strategies once per bar. FxPro's daily bars close at 21:00 UTC in summer (the New York close). `tsmom` only changes positions on the first daily bar of a month, so after a mid-month start it waits for the next month.
+
+**Small accounts.** Position size comes from the risk per trade and is rounded down to the broker's volume step:
+- Index CFDs trade in steps of 0.01 units (about $310 of Nasdaq 100 notional at October 2026 prices), so a $500 to $1,000 balance can follow the risk rules.
+- FX pairs start at 1,000 units. With daily stops that minimum already risks about $15 to $20, so on a $1,000 balance at 0.5% risk every daily-strategy entry is skipped as "size below broker minimum".
 
 Its other behaviour:
-- Decisions, orders and errors go to `logs/journal.jsonl`.
 - Progress and kill-switch state are kept in `state/live_state.json`, so a restart neither repeats a bar nor forgets a halt.
 - The bot only manages positions labelled `fxbot:<strategy>`; manual trades on the account are left alone.
 - If a drawdown halt fires, clear it with `--reset-drawdown` once you have decided to continue.
 
 ## Strategies
+
+Intraday (M5 bars, flat before the close):
+
+| Name | Idea | Evidence (see docs/RESEARCH.md) | Defaults |
+|---|---|---|---|
+| `noise_breakout` | Intraday momentum. The "noise area" spans the average absolute move from the open at each time of day over 14 sessions. Every 30 minutes, go long above it or short below it; hold while price stays beyond both the area and the session's average price; flat 5 minutes before the close. Broker stop 0.5 daily standard deviations away | Zarattini, Aziz & Barbon 2024; Baltussen et al. 2021; Gao et al. 2018 | `days=14 band=1 check=30 stop_sigma=0.5` |
+| `orb` | Opening range breakout: trade the direction of the first 5 minutes, stop at the other end of that range, target 10× the risk, otherwise flat at the close | Zarattini & Aziz 2023; an independent CFD replication found no net edge | `range_minutes=5 target_r=10` |
+
+Daily (D1 bars):
 
 | Name | Idea | Evidence (see docs/RESEARCH.md) | Defaults |
 |---|---|---|---|
@@ -120,24 +158,41 @@ Its other behaviour:
 | `tsmom` | Time-series momentum: majority vote of the 3, 6 and 12-month return signs, acted on monthly; 3-ATR disaster stop | Moskowitz, Ooi & Pedersen 2012; short lookbacks decayed most | `fast=63 medium=126 slow=252 stop_atr=3 rebalance=monthly` |
 | `carry` | Hold the side that earns positive swap (net of the broker's markup) only while price is above/below its 100-bar SMA and volatility is not spiking | Lustig et al. 2011; Brunnermeier et al. 2008; Menkhoff et al. 2012 | `min_carry=1.0 trend=100 vol_cap=1.5 stop_atr=3` |
 
-Results on 10 pairs over 2005 to 2026, with costs: donchian Sharpe −0.18, tsmom −0.10, carry +0.15 (8% max drawdown). Full tables are in the research report.
+Results net of FxPro-like costs (docs/RESEARCH.md §10 and §4):
+- `noise_breakout` on the Nasdaq 100 CFD, 2011–2026: 5.0% a year at 1% risk per trade, Sharpe 0.40, max drawdown 24%, about 250 trades a year. On the S&P 500, DAX, FTSE, gold and FX it lost money.
+- `orb` lost money on all eight markets tested.
+- Daily strategies on 10 FX pairs, 2005–2026: `donchian` Sharpe −0.18, `tsmom` −0.10, `carry` +0.15 (8% max drawdown).
 
 ## Risk controls
 
-These limits are enforced identically in backtests and live (`trading/risk.py`), and each can be set on the command line:
-- 0.5% of equity at risk per trade (position size = risk / stop distance);
-- at most 3% total open risk;
-- at most 1.5% risk per currency and direction;
-- 10× leverage cap;
-- daily-loss halt at 3%;
-- sticky drawdown halt at 20%;
-- a protective stop on every position.
+These limits are enforced identically in backtests and live (`trading/risk.py`). `--risk-profile` picks a preset, and each limit can also be set on its own (for example `--risk-per-trade 0.01`):
+
+| Limit | `standard` (default) | `aggressive` |
+|---|---|---|
+| Equity lost if a new position's stop is hit | 0.5% | 2% |
+| Total open risk | 3% | 6% |
+| Risk per currency and direction | 1.5% | 6% |
+| Open positions | 10 | 6 |
+| Leverage (notional / equity) | 10× | 20× |
+| Daily-loss halt (no new entries until the next UTC day) | 3% | 6% |
+| Sticky drawdown halt (until `--reset-drawdown`) | 20% | 50% |
+
+Every position also carries a broker-side protective stop. Choose the risk per trade knowingly. On the best intraday backtest (docs/RESEARCH.md §11):
+
+| Risk per trade | Return a year | Max drawdown |
+|---|---|---|
+| 2% (`aggressive`) | 7.8% | 51% |
+| 3% | 8.4% | 67% |
+| 5% | 3.8% | 86% |
+
+Above about 3% per trade, more risk means less money. At 2% the account lost half its value from June 2014 to May 2017. With the aggressive profile, that is where the sticky drawdown halt would have stopped the bot until you reset it.
 
 ## Research
 
 ```bash
-python -m research.download          # free data from FRED and Yahoo into data/research/
-python -m research.run_research      # regenerates data/research/results.md (about 5 minutes)
+python -m research.download          # free data from FRED, Yahoo and HistData into data/research/
+python -m research.run_research      # daily strategies: regenerates data/research/results.md (about 5 minutes)
+python -m research.intraday          # intraday strategies: regenerates data/research/intraday_results.md (30-60 minutes)
 ```
 
 ## Tests
@@ -147,7 +202,7 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The tests cover indicators, strategies, risk limits, costs and swaps, the backtester's fills and stops, metrics, data handling, the live trader (against a fake broker), and the cTrader client and adapter (against real protobuf messages with a fake transport).
+The tests cover indicators, sessions and daylight saving, daily and intraday strategies, risk limits and profiles, costs and swaps, the backtester's fills and stops, metrics, data handling, the live trader on daily and five-minute bars (against a fake broker), and the cTrader client and adapter (against real protobuf messages with a fake transport).
 
 ## Project layout
 
@@ -157,11 +212,12 @@ config.py            reads and validates environment variables
 ctrader.py           CTraderClient: connection, auth, typed Deferred-based requests, demo-only order methods
 ctrader_broker.py    CTraderBroker: implements trading.broker.Broker on top of CTraderClient
 trading/
-  models.py          Bar, SymbolSpec, Position, Signal, AccountState
+  models.py          Bar, BarWindow, SymbolSpec (with approximate CFD specs), Position, Signal, AccountState
+  sessions.py        exchange sessions in local time (US, EU, UK, FX), daylight saving included
   indicators.py      SMA, EMA, ATR, Donchian channel, RSI, Bollinger, volatility
-  strategies/        donchian, tsmom (trend.py), carry (carry.py); base class and registry
+  strategies/        noise_breakout, orb (intraday.py); donchian, tsmom (trend.py); carry (carry.py); base class and registry
   planner.py         signal + current position -> close / entry / stop-update actions
-  risk.py            sizing, exposure caps, daily-loss and drawdown kill switches
+  risk.py            sizing, exposure caps, daily-loss and drawdown kill switches, risk profiles
   costs.py           spreads, commission, swaps, rollover counting, currency conversion
   backtest.py        event-driven backtester (shares strategies, planner and risk with live)
   metrics.py         CAGR, Sharpe, drawdowns, trade stats, probabilistic and deflated Sharpe
@@ -191,6 +247,6 @@ Strategies, the planner and the risk manager are pure Python. The backtester and
 
 ## Next steps
 
-1. OAuth authorization-code flow with a local callback, plus token persistence and refresh. Access tokens currently expire after 30 days.
-2. Multi-asset research (indices, metals, energies), where the trend-following evidence is stronger than in FX alone.
-3. Compare months of demo results against backtests of the same period before considering anything else.
+1. Run `noise_breakout` on demo for a few months and compare the journal with a backtest of the same period on FxPro's own bars (`fetch --timeframe M5`). Real fills, spreads and latency are the biggest unknowns.
+2. OAuth authorization-code flow with a local callback, plus token persistence and refresh. Access tokens currently expire after 30 days.
+3. An exchange holiday calendar, so that half-day sessions close positions at the early close.

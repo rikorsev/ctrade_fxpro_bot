@@ -32,6 +32,7 @@ class Strategy(ABC):
 
     name: ClassVar[str]
     Params: ClassVar[type]  # frozen dataclass whose fields all have defaults
+    default_timeframe: ClassVar[str] = "D1"  # bars the strategy was designed for
 
     def __init__(self, params: Any = None, **overrides: Any) -> None:
         params = params if params is not None else self.Params()
@@ -42,6 +43,12 @@ class Strategy(ABC):
 
     def validate(self) -> None:
         """Raise ValueError for inconsistent parameters."""
+
+    def check_timeframe(self, timeframe: str) -> None:
+        """Raise ValueError if the strategy cannot run on bars of ``timeframe``."""
+
+    def check_symbol(self, symbol: str) -> None:
+        """Raise ValueError if the strategy cannot trade ``symbol``."""
 
     @property
     @abstractmethod

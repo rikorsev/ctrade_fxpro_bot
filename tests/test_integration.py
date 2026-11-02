@@ -80,7 +80,7 @@ def result_of(coroutine):
 def test_signal_to_order_through_the_cTrader_adapter(tmp_path):
     client = FakeCTraderClient()
     broker = CTraderBroker(client, label_prefix="fxbot")
-    result_of(broker.load(["EURUSD"]))
+    assert result_of(broker.load(["EURUSD", "#JP225_Z26"])) == ["#JP225_Z26"]  # not offered: reported, not raised
     assert broker.account_currency == "USD"
     assert broker.symbol_spec("EURUSD").min_volume == 1_000
 

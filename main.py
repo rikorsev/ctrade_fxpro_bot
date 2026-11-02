@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import itertools
 import logging
 import sys
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from config import default_symbols, load_config
-from trading.risk import RiskConfig
+from trading.risk import RISK_PROFILES, RiskConfig
 
 log = logging.getLogger("fxbot")
 
@@ -84,6 +85,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
     config = load_config()
     symbols = _symbols(args)
+    timeframe = args.timeframe or "D1"
     end = datetime.now(timezone.utc)
     start = _parse_date(args.start) if args.start else end - timedelta(days=round(365.25 * args.years))
     client = CTraderClient(config.client_id, config.client_secret, config.access_token, config.account_id,
@@ -96,14 +98,18 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             return
         done["started"] = True
         try:
-            await broker.load(symbols)
+            missing = await broker.load(symbols)
+            if missing:
+                log.warning("Skipping %s: not offered on this account", ", ".join(missing))
+                _FAILURES.append("some symbols are not offered")
+            symbols[:] = [s for s in symbols if s not in missing]
             for symbol in symbols:
-                bars = await broker.history(symbol, args.timeframe, start, end)
-                bars = [b for b in bars if b.time + timeframe_delta(args.timeframe) <= end]
-                path = bars_path(args.data, symbol, args.timeframe)
+                bars = await broker.history(symbol, timeframe, start, end)
+                bars = [b for b in bars if b.time + timeframe_delta(timeframe) <= end]
+                path = bars_path(args.data, symbol, timeframe)
                 write_bars(path, bars)
                 first = f"{bars[0].time:%Y-%m-%d}" if bars else "-"
-                log.info("%s: %d %s bars from %s -> %s", symbol, len(bars), args.timeframe, first, path)
+                log.info("%s: %d %s bars from %s -> %s", symbol, len(bars), timeframe, first, path)
             save_specs(Path(args.data) / SPECS_FILE, {s: broker.symbol_spec(s) for s in symbols})
             log.info("Contract specs (digits, volumes, swaps) saved to %s", Path(args.data) / SPECS_FILE)
         except Exception:
@@ -125,21 +131,25 @@ def cmd_trade(args: argparse.Namespace) -> None:
     from ctrader import CTraderClient
     from ctrader_broker import CTraderBroker
     from trading.live import LiveConfig, LiveTrader
+    from trading.models import timeframe_delta
     from trading.risk import RiskManager
 
     config = load_config()
     if config.live:
         sys.exit("Refusing to run: CTRADER_LIVE=1. This bot only trades demo accounts.")
     symbols = _symbols(args)
-    strategies = build_strategies(args.strategy, args.param)
+    timeframe = resolve_timeframe(args.timeframe, args.strategy)
+    strategies = build_strategies(args.strategy, args.param, timeframe)
     risk = RiskManager(risk_config(args))
     client = CTraderClient(config.client_id, config.client_secret, config.access_token, config.account_id,
                            config.live, on_fatal=_stop_reactor)
     broker = CTraderBroker(client, label_prefix=args.label)
+    intraday = timeframe_delta(timeframe) < timedelta(hours=1)
     live_config = LiveConfig(
         symbols=tuple(symbols),
-        timeframe=args.timeframe,
+        timeframe=timeframe,
         execute=args.execute,
+        settle=timedelta(seconds=3 if intraday else 15),
         state_path=Path(args.state),
         journal_path=Path(args.journal),
     )
@@ -150,7 +160,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
 
     log.info("Mode: %s on demo account. Strategies: %s. Symbols: %s. Timeframe: %s.",
              "EXECUTE" if args.execute else "DRY RUN (no orders)", ", ".join(s.describe() for s in strategies),
-             ", ".join(symbols), args.timeframe)
+             ", ".join(trader.symbols), timeframe)
     log.info("Risk: %s", risk.config)
 
     loop = task.LoopingCall(lambda: defer.ensureDeferred(trader.tick()).addErrback(
@@ -162,9 +172,14 @@ def cmd_trade(args: argparse.Namespace) -> None:
             _stop_reactor("This access token only has the 'accounts' (view) scope, so orders would be refused. "
                           "Generate a token with the 'trading' scope, or run without --execute for a dry run.")
             return
-        await broker.load(symbols)
+        for symbol in await broker.load(trader.symbols):
+            trader.ignore(symbol, "not offered on this account")
+        if not trader.symbols:
+            client.stop()
+            _stop_reactor("None of the symbols can be traded; check --symbols or CTRADER_SYMBOLS.")
+            return
         if not loop.running:
-            loop.start(args.poll, now=True)
+            loop.start(args.poll or (5.0 if intraday else 60.0), now=True)
 
     client.on_ready(on_ready)
     client.start()
@@ -199,12 +214,13 @@ def _run_reactor() -> None:
 def cmd_backtest(args: argparse.Namespace) -> None:
     from trading.metrics import summarize, yearly_returns
 
-    strategies = build_strategies(args.strategy, args.param)
-    result = _run_backtest(args, strategies)
+    timeframe = resolve_timeframe(args.timeframe, args.strategy)
+    strategies = build_strategies(args.strategy, args.param, timeframe)
+    result = _run_backtest(args, strategies, timeframe)
     summary = summarize(result)
     print(f"\nStrategies: {', '.join(s.describe() for s in strategies)}")
-    print(f"Symbols: {', '.join(_symbols(args))} ({args.timeframe}), costs x{args.cost_multiplier:g}, "
-          f"swaps: {args.swaps}\n")
+    print(f"Symbols: {', '.join(_symbols(args))} ({timeframe}), costs x{args.cost_multiplier:g}, "
+          f"swaps: {args.swaps}, risk profile: {args.risk_profile}\n")
     print(summary.format())
     print("\nYear   Return")
     for year, ret in yearly_returns(result):
@@ -218,7 +234,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 
 def cmd_sweep(args: argparse.Namespace) -> None:
     from trading.metrics import daily_equity, deflated_sharpe, per_period_sharpe, returns, summarize
-    from trading.strategies import create_strategy
+    from trading.strategies import create_strategy, with_timeframe
 
     grid = {}
     for item in args.grid:
@@ -227,14 +243,15 @@ def cmd_sweep(args: argparse.Namespace) -> None:
             raise ValueError(f"--grid expects key=v1,v2,..., got {item!r}")
         grid[key] = values.split(",")
     combos = [dict(zip(grid, values)) for values in itertools.product(*grid.values())]
+    timeframe = resolve_timeframe(args.timeframe, [args.strategy])
     rows, sharpes, series = [], [], []
     for combo in combos:
         try:
-            strategy = create_strategy(args.strategy, **combo)
+            strategy = create_strategy(args.strategy, **with_timeframe(args.strategy, combo, timeframe))
         except ValueError as exc:
             log.info("Skipping %s: %s", combo, exc)
             continue
-        result = _run_backtest(args, [strategy])
+        result = _run_backtest(args, [strategy], timeframe)
         rets = returns([v for _, v in daily_equity(result.equity_curve)])
         s = summarize(result)
         rows.append((combo, s))
@@ -255,7 +272,7 @@ def cmd_sweep(args: argparse.Namespace) -> None:
           "below ~95% the 'best' result is plausibly luck)")
 
 
-def _run_backtest(args: argparse.Namespace, strategies):
+def _run_backtest(args: argparse.Namespace, strategies, timeframe: str):
     from trading.backtest import Backtester
     from trading.costs import BrokerSwaps, CostModel
     from trading.data import SPECS_FILE, bars_path, load_bars, load_specs
@@ -268,26 +285,31 @@ def _run_backtest(args: argparse.Namespace, strategies):
     for spec in specs.values():
         for a, b in ((spec.quote, args.currency), (spec.quote, "USD"), ("USD", args.currency)):
             for pair in (a + b, b + a):
-                if a != b and pair not in symbols and bars_path(args.data, pair, args.timeframe).exists():
+                if a != b and pair not in symbols and bars_path(args.data, pair, timeframe).exists():
                     helpers.add(pair)
-    bars = load_bars(args.data, list(symbols) + sorted(helpers), args.timeframe)
-    if args.timeframe == "D1":
+    bars = load_bars(args.data, list(symbols) + sorted(helpers), timeframe)
+    if timeframe == "D1":
         from trading.data import merge_weekend_bars
 
         bars = {s: merge_weekend_bars(b) for s, b in bars.items()}
     costs = CostModel()
-    if args.spread:
-        overrides = dict(item.upper().split("=") for item in args.spread)
-        costs = CostModel(spread_pips={**costs.spread_pips, **{k: float(v) for k, v in overrides.items()}})
+    for item in args.spread or []:
+        name, sep, value = item.upper().partition("=")
+        if not sep:
+            raise ValueError(f"--spread expects SYMBOL=VALUE, got {item!r}")
+        if name in costs.spread_bp:
+            costs = dataclasses.replace(costs, spread_bp={**costs.spread_bp, name: float(value)})
+        else:
+            costs = dataclasses.replace(costs, spread_pips={**costs.spread_pips, name: float(value)})
     if args.commission is not None:
-        costs = CostModel(costs.spread_pips, costs.default_spread_pips, costs.slippage_pips, args.commission)
+        costs = dataclasses.replace(costs, commission_per_million=args.commission)
     if args.swaps == "broker" and not any(s.swap_long or s.swap_short for s in specs.values()):
         log.warning("No swap rates in %s (run `fetch` first); backtesting without swaps", Path(args.data) / SPECS_FILE)
     swaps = BrokerSwaps() if args.swaps == "broker" else _NoSwaps()
     return Backtester(
         strategies,
         bars,
-        timeframe=args.timeframe,
+        timeframe=timeframe,
         symbols=symbols,
         specs=specs,
         costs=costs.scaled(args.cost_multiplier),
@@ -321,8 +343,21 @@ def _write_trades(path: Path, trades) -> None:
 # -- argument helpers ----------------------------------------------------------
 
 
-def build_strategies(names: list[str], params: list[str] | None):
-    from trading.strategies import create_strategy
+def resolve_timeframe(timeframe: str | None, names: list[str]) -> str:
+    """--timeframe if given, otherwise the timeframe the selected strategies were designed for."""
+    from trading.strategies import STRATEGIES
+
+    if timeframe:
+        return timeframe
+    defaults = {STRATEGIES[name].default_timeframe for name in names}
+    if len(defaults) > 1:
+        raise ValueError(f"the selected strategies use different timeframes ({', '.join(sorted(defaults))}); "
+                         "pass --timeframe")
+    return defaults.pop()
+
+
+def build_strategies(names: list[str], params: list[str] | None, timeframe: str):
+    from trading.strategies import create_strategy, with_timeframe
 
     overrides: dict[str, dict[str, str]] = {n: {} for n in names}
     for item in params or []:
@@ -338,19 +373,17 @@ def build_strategies(names: list[str], params: list[str] | None):
             overrides[names[0]][key] = value
         else:
             raise ValueError(f"--param {item}: prefix it with the strategy, e.g. {names[0]}.{key}={value}")
-    return [create_strategy(n, **overrides[n]) for n in names]
+    return [create_strategy(n, **with_timeframe(n, overrides[n], timeframe)) for n in names]
+
+
+RISK_FIELDS = ("risk_per_trade", "max_open_risk", "max_currency_risk", "max_positions", "max_leverage",
+               "max_daily_loss", "max_drawdown")
 
 
 def risk_config(args: argparse.Namespace) -> RiskConfig:
-    return RiskConfig(
-        risk_per_trade=args.risk_per_trade,
-        max_open_risk=args.max_open_risk,
-        max_currency_risk=args.max_currency_risk,
-        max_positions=args.max_positions,
-        max_leverage=args.max_leverage,
-        max_daily_loss=args.max_daily_loss,
-        max_drawdown=args.max_drawdown,
-    )
+    """The --risk-profile preset with any individually given limits applied on top."""
+    overrides = {name: getattr(args, name) for name in RISK_FIELDS if getattr(args, name) is not None}
+    return dataclasses.replace(RISK_PROFILES[args.risk_profile], **overrides)
 
 
 def _symbols(args: argparse.Namespace) -> list[str]:
@@ -374,7 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def data_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--symbols", help="comma-separated symbols (default: CTRADER_SYMBOLS or CTRADER_SYMBOL)")
-        p.add_argument("--timeframe", default="D1", help="M1 M5 M15 M30 H1 H4 H12 D1 W1 (default: D1)")
+        p.add_argument("--timeframe", help="M1 M5 M15 M30 H1 H4 H12 D1 W1 (default: the strategy's own, "
+                       "M5 for intraday strategies and D1 for the others; D1 for fetch)")
         p.add_argument("--data", default="data", help="directory for CSV bars and symbols.json (default: data)")
 
     def strategy_args(p: argparse.ArgumentParser) -> None:
@@ -385,15 +419,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="override a parameter: key=value, or strategy.key=value with several strategies")
 
     def risk_args(p: argparse.ArgumentParser) -> None:
-        d = RiskConfig()
-        p.add_argument("--risk-per-trade", type=float, default=d.risk_per_trade,
-                       help=f"equity fraction lost if a stop is hit (default: {d.risk_per_trade})")
-        p.add_argument("--max-open-risk", type=float, default=d.max_open_risk)
-        p.add_argument("--max-currency-risk", type=float, default=d.max_currency_risk)
-        p.add_argument("--max-positions", type=int, default=d.max_positions)
-        p.add_argument("--max-leverage", type=float, default=d.max_leverage)
-        p.add_argument("--max-daily-loss", type=float, default=d.max_daily_loss)
-        p.add_argument("--max-drawdown", type=float, default=d.max_drawdown)
+        p.add_argument("--risk-profile", choices=list(RISK_PROFILES), default="standard",
+                       help="preset risk limits (default: standard); the options below override single limits")
+        for name in RISK_FIELDS:
+            kind = int if name == "max_positions" else float
+            values = ", ".join(f"{profile} {getattr(cfg, name):g}" for profile, cfg in RISK_PROFILES.items())
+            help_text = f"({values})"
+            if name == "risk_per_trade":
+                help_text = f"equity fraction lost if a stop is hit {help_text}"
+            p.add_argument("--" + name.replace("_", "-"), type=kind, help=help_text)
 
     def backtest_args(p: argparse.ArgumentParser) -> None:
         data_args(p)
@@ -431,7 +465,8 @@ def build_parser() -> argparse.ArgumentParser:
     data_args(trade)
     risk_args(trade)
     trade.add_argument("--execute", action="store_true", help="send orders (demo accounts only)")
-    trade.add_argument("--poll", type=float, default=60.0, help="seconds between checks for new bars")
+    trade.add_argument("--poll", type=float,
+                       help="seconds between checks for new bars (default: 5 for M1-M30, 60 otherwise)")
     trade.add_argument("--label", default="fxbot", help="position label prefix used to recognise bot trades")
     trade.add_argument("--state", default="state/live_state.json", help="risk and progress state file")
     trade.add_argument("--journal", default="logs/journal.jsonl", help="JSON-lines decision/order journal")

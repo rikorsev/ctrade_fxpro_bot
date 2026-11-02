@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import dataclasses
 import json
+import shlex
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -89,7 +90,8 @@ def load_bars(data_dir: str | Path, symbols: Sequence[str], timeframe: str) -> d
         path = bars_path(data_dir, symbol, timeframe)
         if not path.exists():
             raise FileNotFoundError(
-                f"{path} not found; download it with: python main.py fetch --symbols {symbol} --timeframe {timeframe}"
+                f"{path} not found; download it with: "
+                f"python main.py fetch --symbols {shlex.quote(symbol)} --timeframe {timeframe}"
             )
         out[symbol.upper()] = read_bars(path)
     return out

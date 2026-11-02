@@ -59,6 +59,8 @@ class LiveTrader:
         names = [s.name for s in strategies]
         if not names or len(set(names)) != len(names):
             raise ValueError("need at least one strategy, with distinct names")
+        for strategy in strategies:
+            strategy.check_timeframe(config.timeframe)
         self.broker = broker
         self.strategies = list(strategies)
         self.risk = risk
@@ -70,7 +72,36 @@ class LiveTrader:
         self._next_check: dict[str, datetime] = {}
         self._retry: dict[str, timedelta] = {}
         self._busy = False
+        # Which strategies run on each symbol. A symbol a strategy cannot trade is left out, not fatal.
+        self._plan: dict[str, list[Strategy]] = {}
+        for symbol in config.symbols:
+            usable = []
+            for strategy in self.strategies:
+                try:
+                    strategy.check_symbol(symbol)
+                except ValueError as exc:
+                    self._skip(symbol, f"{strategy.name} cannot trade it: {exc}", strategy=strategy.name)
+                else:
+                    usable.append(strategy)
+            if usable:
+                self._plan[symbol] = usable
+        if not self._plan:
+            raise ValueError(f"none of the strategies can trade {', '.join(config.symbols) or 'any symbol'}")
         self._load_state()
+
+    @property
+    def symbols(self) -> list[str]:
+        """The symbols being traded, without those ignored."""
+        return list(self._plan)
+
+    def ignore(self, symbol: str, reason: str) -> None:
+        """Stop trading ``symbol`` (for example, the account does not offer it); the others carry on."""
+        if self._plan.pop(symbol.upper(), None) is not None:
+            self._skip(symbol.upper(), reason)
+
+    def _skip(self, symbol: str, reason: str, **fields: Any) -> None:
+        log.warning("Ignoring %s: %s", symbol, reason)
+        self._journal("symbol_ignored", symbol=symbol, reason=reason, **fields)
 
     async def tick(self) -> bool:
         """Run a trading cycle if a new bar has closed on any symbol. Returns True if one ran."""
@@ -80,7 +111,7 @@ class LiveTrader:
         try:
             now = self.clock()
             fresh = {}
-            for symbol in self.config.symbols:
+            for symbol in self.symbols:
                 due = self._next_check.get(symbol)
                 if due is not None and now < due:
                     continue
@@ -139,23 +170,32 @@ class LiveTrader:
         updates: list[StopUpdate] = []
         entries: list[EntryIntent] = []
         for symbol, bars in fresh.items():
-            for strategy in self.strategies:
+            for strategy in self._plan.get(symbol, ()):
                 window = bars[-strategy.lookback:]
                 if len(window) < strategy.lookback:
                     log.warning("%s: %s needs %d bars, broker returned %d", symbol, strategy.name,
                                 strategy.lookback, len(window))
                     continue
                 position = held.get((strategy.name, symbol))
-                signal = strategy.on_bar(symbol, window, position, context)
-                actions = plan_actions(strategy.name, symbol, signal, position)
-                log.info("%s %s bar %s close %g: %s%s", strategy.name, symbol, f"{window[-1].time:%Y-%m-%d %H:%M}",
-                         window[-1].close, "no opinion" if signal is None else
-                         f"{side_name(signal.direction)} ({signal.reason})",
-                         "" if not actions else " -> " + ", ".join(type(a).__name__ for a in actions))
-                self._journal("signal", strategy=strategy.name, symbol=symbol, bar=window[-1].time,
-                              close=window[-1].close, direction=None if signal is None else signal.direction,
-                              reason=None if signal is None else signal.reason,
-                              actions=[type(a).__name__ for a in actions])
+                try:
+                    signal = strategy.on_bar(symbol, window, position, context)
+                    actions = plan_actions(strategy.name, symbol, signal, position)
+                except Exception as exc:  # one strategy failing on one symbol must not stop the others
+                    log.exception("%s %s: strategy failed on bar %s; skipping this bar", strategy.name, symbol,
+                                  f"{window[-1].time:%Y-%m-%d %H:%M}")
+                    self._journal("strategy_failed", strategy=strategy.name, symbol=symbol, bar=window[-1].time,
+                                  error=f"{type(exc).__name__}: {exc}")
+                    continue
+                # Intraday strategies have no opinion on most bars; only log and journal the ones that matter.
+                log.log(logging.INFO if signal is not None else logging.DEBUG,
+                        "%s %s bar %s close %g: %s%s", strategy.name, symbol, f"{window[-1].time:%Y-%m-%d %H:%M}",
+                        window[-1].close, "no opinion" if signal is None else
+                        f"{side_name(signal.direction)} ({signal.reason})",
+                        "" if not actions else " -> " + ", ".join(type(a).__name__ for a in actions))
+                if signal is not None:
+                    self._journal("signal", strategy=strategy.name, symbol=symbol, bar=window[-1].time,
+                                  close=window[-1].close, direction=signal.direction, reason=signal.reason,
+                                  actions=[type(a).__name__ for a in actions])
                 for action in actions:
                     if isinstance(action, CloseIntent):
                         closes.append(action)
@@ -190,9 +230,9 @@ class LiveTrader:
         positions: list[Position],
         prices: dict[str, float],
     ) -> Position | None:
-        spec = self.broker.symbol_spec(intent.symbol)
         price = prices[intent.symbol]
         try:
+            spec = self.broker.symbol_spec(intent.symbol)
             rate = await self.broker.conversion_rate(spec.quote, account.currency)
             exposures = [await self._exposure(p, account, prices) for p in positions]
         except Exception as exc:

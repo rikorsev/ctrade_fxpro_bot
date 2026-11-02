@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from trading.models import Bar, Position, Signal
+from trading.sessions import SESSIONS
 from trading.strategies import MarketContext, Strategy
 
 UTC = timezone.utc
@@ -62,3 +63,39 @@ class FixedCarry:
 
     def annual_carry(self, symbol, direction, price, time):
         return self.table.get((symbol, direction))
+
+
+def session_days(start: date, count: int) -> list[date]:
+    """``count`` consecutive weekdays from ``start``."""
+    days, d = [], start
+    while len(days) < count:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def session_bars(day: date, opening: float, closes: Sequence[float], session: str = "us",
+                 minutes: int = 5) -> list[Bar]:
+    """Bars from the session open on ``day``; each opens at the previous close."""
+    start, _ = SESSIONS[session].bounds(day)
+    bars, previous = [], opening
+    for i, close in enumerate(closes):
+        bars.append(Bar(start + timedelta(minutes=minutes * i), previous, max(previous, close),
+                        min(previous, close), close))
+        previous = close
+    return bars
+
+
+def quiet_sessions(days: Sequence[date], opening: float = 100.0, wiggle: float = 0.001,
+                   session: str = "us") -> list[Bar]:
+    """Full sessions that zigzag ``wiggle`` around their open and close alternately up and down a little."""
+    bars_per_session = SESSIONS[session].minutes() // 5
+    bars, price = [], opening
+    for n, day in enumerate(days):
+        sign = 1 if n % 2 == 0 else -1
+        closes = [price * (1 + wiggle * (1 if i % 2 == 0 else -1)) for i in range(bars_per_session - 1)]
+        closes.append(price * (1 + sign * wiggle))
+        bars += session_bars(day, price, closes, session)
+        price = closes[-1]
+    return bars

@@ -4,6 +4,9 @@
   1999 is spliced from the Deutsche mark at the fixed 1.95583 DEM/EUR rate.
 * FRED (OECD) monthly short-term interest rates, used to model swaps/carry.
 * Yahoo Finance daily OHLC, December 2003 onwards.
+* HistData.com one-minute bid bars (FX, gold and index CFDs), 2010 onwards,
+  aggregated to five-minute bars for the intraday research. The zip files are
+  cached in data/research/raw/histdata/.
 
 Files land in data/research/ (gitignored). The data is for personal research;
 check each provider's terms before redistributing it.
@@ -16,18 +19,21 @@ import argparse
 import csv
 import io
 import json
+import re
 import statistics
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import date, datetime, timezone
+import zipfile
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trading.data import merge_weekend_bars, write_bars  # noqa: E402
+from trading.data import merge_weekend_bars, resample, write_bars  # noqa: E402
 from trading.models import Bar  # noqa: E402
 
 OUT = Path("data/research")
@@ -65,12 +71,15 @@ YAHOO = {
 }
 
 
-def get(url: str, tries: int = 6) -> bytes:
+def get(url: str, tries: int = 6, *, html: bool = False, form: dict | None = None,
+        headers: dict | None = None) -> bytes:
+    data = urllib.parse.urlencode(form).encode() if form else None
     for attempt in range(tries):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90) as r:
+            request = urllib.request.Request(url, data=data, headers={**UA, **(headers or {})})
+            with urllib.request.urlopen(request, timeout=90) as r:
                 body = r.read()
-            if body.lstrip()[:1] == b"<":
+            if not html and body.lstrip()[:1] == b"<":
                 raise ValueError("got an HTML page instead of data")
             return body
         except (urllib.error.URLError, ValueError, TimeoutError) as exc:
@@ -183,11 +192,86 @@ def download_yahoo() -> None:
         time.sleep(1)
 
 
+# HistData pair -> FxPro cTrader symbol name (upper-cased, as the broker adapter reports it).
+HISTDATA = {
+    "SPXUSD": "#USSPX500",
+    "NSXUSD": "#USNDAQ100",
+    "GRXEUR": "#GERMANY40",
+    "UKXGBP": "#UK100",
+    "XAUUSD": "XAUUSD",
+    "EURUSD": "EURUSD",
+    "GBPUSD": "GBPUSD",
+    "USDJPY": "USDJPY",
+}
+HISTDATA_FIRST_YEAR = 2010
+HISTDATA_PAGE = "https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes/{}"
+HISTDATA_OFFSET = timedelta(hours=5)  # HistData stamps are EST all year round (no daylight saving)
+
+
+def histdata_zip(pair: str, year: int, month: int | None = None) -> bytes | None:
+    """One year (or, for the current year, one month) of HistData M1 bars as a zip, or None if not published."""
+    period = f"{year}" if month is None else f"{year}{month:02d}"
+    cache = OUT / "raw" / "histdata" / f"{pair}_{period}.zip"
+    if cache.exists():
+        return cache.read_bytes()
+    page_url = HISTDATA_PAGE.format(f"{pair.lower()}/{year}" + ("" if month is None else f"/{month}"))
+    page = get(page_url, html=True).decode(errors="replace")
+    form = {}
+    for name in ("tk", "date", "datemonth", "platform", "timeframe", "fxpair"):
+        found = re.search(rf'name="{name}" id="{name}" value="([^"]*)"', page)
+        form[name] = found.group(1) if found else ""
+    if not form["tk"]:
+        return None
+    blob = get("https://www.histdata.com/get.php", form=form, headers={"Referer": page_url})
+    if blob[:2] != b"PK":
+        raise RuntimeError(f"HistData {pair} {period}: expected a zip file")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(blob)
+    time.sleep(1)
+    return blob
+
+
+def histdata_bars(blob: bytes) -> list[Bar]:
+    """Parse a HistData ASCII M1 zip (``YYYYMMDD HHMMSS;open;high;low;close;volume``) into UTC bars."""
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        name = next(n for n in archive.namelist() if n.lower().endswith(".csv"))
+        text = archive.read(name).decode()
+    bars = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        stamp, o, h, low, c, *_ = line.split(";")
+        est = datetime(int(stamp[0:4]), int(stamp[4:6]), int(stamp[6:8]), int(stamp[9:11]), int(stamp[11:13]),
+                       tzinfo=timezone.utc)
+        bars.append(Bar(est + HISTDATA_OFFSET, float(o), float(h), float(low), float(c)))
+    return bars
+
+
+def download_histdata(timeframe: str = "M5") -> None:
+    today = datetime.now(timezone.utc).date()
+    for pair, symbol in HISTDATA.items():
+        by_time: dict[datetime, Bar] = {}
+        for year in range(HISTDATA_FIRST_YEAR, today.year + 1):
+            months = [None] if year < today.year else range(1, today.month + 1)
+            for month in months:
+                blob = histdata_zip(pair, year, month)
+                if blob is None:
+                    continue
+                for bar in resample(histdata_bars(blob), timeframe):
+                    by_time[bar.time] = bar
+            print(f"HistData {pair} {year}: {len(by_time)} {timeframe} bars so far", flush=True)
+        bars = [by_time[t] for t in sorted(by_time)]
+        write_bars(OUT / "intraday" / f"{symbol}_{timeframe}.csv", bars)
+        print(f"HistData {symbol}: {len(bars)} {timeframe} bars {bars[0].time:%Y-%m-%d} .. {bars[-1].time:%Y-%m-%d}",
+              flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--only", choices=["fred", "rates", "yahoo"], help="download one dataset")
+    parser.add_argument("--only", choices=["fred", "rates", "yahoo", "histdata"], help="download one dataset")
     args = parser.parse_args()
-    jobs = {"fred": download_fred_fx, "rates": download_rates, "yahoo": download_yahoo}
+    jobs = {"fred": download_fred_fx, "rates": download_rates, "yahoo": download_yahoo,
+            "histdata": download_histdata}
     for name, job in jobs.items():
         if args.only in (None, name):
             job()

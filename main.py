@@ -56,7 +56,7 @@ def cmd_quotes(args: argparse.Namespace) -> None:
             spread = f" spread={(state['ask'] - state['bid']) / state['pip']:.1f} pips"
         print(f"{symbol:8s} bid={bid!s:>12} ask={ask!s:>12}{spread}")
 
-    client = CTraderClient(config.client_id, config.client_secret, config.access_token, config.account_id,
+    client = CTraderClient(config.client_id, config.client_secret, config.tokens(), config.account_id,
                            config.live, on_spot=on_spot, on_fatal=_stop_reactor)
 
     async def subscribe(c: CTraderClient) -> None:
@@ -88,7 +88,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     timeframe = args.timeframe or "D1"
     end = datetime.now(timezone.utc)
     start = _parse_date(args.start) if args.start else end - timedelta(days=round(365.25 * args.years))
-    client = CTraderClient(config.client_id, config.client_secret, config.access_token, config.account_id,
+    client = CTraderClient(config.client_id, config.client_secret, config.tokens(), config.account_id,
                            config.live, on_fatal=_stop_reactor)
     broker = CTraderBroker(client)
     done = {"started": False}
@@ -141,7 +141,7 @@ def cmd_trade(args: argparse.Namespace) -> None:
     timeframe = resolve_timeframe(args.timeframe, args.strategy)
     strategies = build_strategies(args.strategy, args.param, timeframe)
     risk = RiskManager(risk_config(args))
-    client = CTraderClient(config.client_id, config.client_secret, config.access_token, config.account_id,
+    client = CTraderClient(config.client_id, config.client_secret, config.tokens(), config.account_id,
                            config.live, on_fatal=_stop_reactor)
     broker = CTraderBroker(client, label_prefix=args.label)
     intraday = timeframe_delta(timeframe) < timedelta(hours=1)
@@ -163,8 +163,13 @@ def cmd_trade(args: argparse.Namespace) -> None:
              ", ".join(trader.symbols), timeframe)
     log.info("Risk: %s", risk.config)
 
-    loop = task.LoopingCall(lambda: defer.ensureDeferred(trader.tick()).addErrback(
-        lambda f: log.error("Trading cycle failed: %s", f.getTraceback())))
+    def run_cycle():
+        if not client.ready:
+            return None  # reconnecting: check again on the next poll instead of failing every symbol
+        return defer.ensureDeferred(trader.tick()).addErrback(
+            lambda f: log.error("Trading cycle failed: %s", f.getTraceback()))
+
+    loop = task.LoopingCall(run_cycle)
 
     async def on_ready(_: CTraderClient) -> None:
         if args.execute and client.can_trade is False:

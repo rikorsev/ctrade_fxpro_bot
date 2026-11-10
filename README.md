@@ -28,7 +28,8 @@ Register an application in the cTrader Open API portal and obtain:
 
 For a real OAuth application, configure a redirect URI and obtain an access token.
 For initial personal testing, cTrader also provides a Playground from the Applications page.
-Access tokens expire after 30 days; generate a new one when the bot reports an authentication error.
+
+Keep the **refresh token** that comes with the access token. Access tokens expire after 30 days. With `CTRADER_REFRESH_TOKEN` set, the bot renews an expired token when it logs in, also in the middle of a run, and saves the new pair in `state/ctrader_token.json`. Restarts and the other commands then use the saved pair, as long as `.env` still holds the token it was renewed from. Put a fresh token in `.env` and the saved pair is ignored. Without a refresh token the bot stops when the token expires, and you need to generate a new one.
 
 Choose the **trading** scope when you generate the token (with the OAuth URL, `scope=trading`). A token with the `accounts` (view) scope works for quotes, `fetch`, backtests and dry runs. The server rejects its orders, though, so `trade --execute` refuses to start with one. The bot logs the token's scope at every login.
 
@@ -48,6 +49,7 @@ Copy `.env.example` to `.env` in the repository root (it is loaded automatically
 CTRADER_CLIENT_ID=your-client-id
 CTRADER_CLIENT_SECRET=your-client-secret
 CTRADER_ACCESS_TOKEN=your-access-token
+CTRADER_REFRESH_TOKEN=your-refresh-token
 CTRADER_ACCOUNT_ID=
 CTRADER_SYMBOL=EURUSD
 CTRADER_SYMBOLS=#USNDAQ100
@@ -61,6 +63,7 @@ FxPro names its index CFDs with a leading `#` (`#USNDAQ100`, `#USSPX500`, `#Germ
 | `CTRADER_CLIENT_ID` | yes | | Open API application client ID |
 | `CTRADER_CLIENT_SECRET` | yes | | Open API application client secret |
 | `CTRADER_ACCESS_TOKEN` | yes | | OAuth access token |
+| `CTRADER_REFRESH_TOKEN` | no (recommended) | | OAuth refresh token, used to renew the access token when it expires |
 | `CTRADER_ACCOUNT_ID` | no | first demo account for the token | cTID trader account ID |
 | `CTRADER_SYMBOL` | no | `EURUSD` | Symbol for the quote stream (case-insensitive) |
 | `CTRADER_SYMBOLS` | no | `CTRADER_SYMBOL` | Comma-separated default symbols for `fetch`, `backtest`, `sweep` and `trade` |
@@ -248,5 +251,5 @@ Strategies, the planner and the risk manager are pure Python. The backtester and
 ## Next steps
 
 1. Run `noise_breakout` on demo for a few months and compare the journal with a backtest of the same period on FxPro's own bars (`fetch --timeframe M5`). Real fills, spreads and latency are the biggest unknowns.
-2. OAuth authorization-code flow with a local callback, plus token persistence and refresh. Access tokens currently expire after 30 days.
+2. OAuth authorization-code flow with a local callback, so that a first token pair does not have to be copied from the Playground.
 3. An exchange holiday calendar, so that half-day sessions close positions at the early close.

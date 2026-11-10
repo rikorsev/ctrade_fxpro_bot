@@ -33,6 +33,7 @@ There is no linter or build step.
 Configuration comes from environment variables or a `.env` file (gitignored; loaded by `python-dotenv` in `config.py`):
 - Required: `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, `CTRADER_ACCESS_TOKEN`
 - Optional:
+  - `CTRADER_REFRESH_TOKEN`: lets the client renew an expired access token. `config.TokenStore` saves the renewed pair in `state/ctrader_token.json` (gitignored, mode 0600). The saved pair is used only while `CTRADER_ACCESS_TOKEN` is still the token it was renewed from.
   - `CTRADER_ACCOUNT_ID`: if empty, the first account whose live/demo flag matches the host is used.
   - `CTRADER_SYMBOL`: default `EURUSD` (`.env.example` uses `#USNDAQ100`; FxPro index CFD names start with `#`).
   - `CTRADER_SYMBOLS`: comma-separated; defaults to `CTRADER_SYMBOL`.
@@ -82,7 +83,10 @@ The layering is strategy → planner/risk → broker interface → cTrader clien
 - `ctrader.py`: `CTraderClient`.
   - Authentication runs as an async flow on every (re)connect, then the `on_ready` callbacks run.
   - The flow always fetches the token's account list. This records `can_trade` from `permissionScope`, and checks that a configured `CTRADER_ACCOUNT_ID` belongs to the token and to the host's live/demo kind.
-  - `request()` returns a Deferred of the decoded payload. Responses are matched by `clientMsgId`, which the library handles. Error payloads raise `CTraderError`.
+  - If the token is rejected (`TOKEN_ERRORS`), the flow first adopts a pair another run has saved, else sends `ProtoOARefreshTokenReq`, saves the result and retries once. Without a refresh token, or when the refresh fails, the error is fatal.
+  - `_session` is bumped on every connect and disconnect. Login and `on_ready` failures from an older session are ignored, because restarting would drop the new connection. Failures in the current session reconnect after `RETRY_DELAY`.
+  - `request()` returns a Deferred of the decoded payload. Each request gets a random `clientMsgId`. Error payloads raise `CTraderError`.
+  - On a disconnect, unanswered requests fail at once with `DISCONNECTED`. The library forgets them silently. Account requests and orders sent while not logged in fail with `NOT_READY` and are never queued. `main.py trade` skips polls while `client.ready` is false.
   - `_on_message` handles only unsolicited events: spots, execution events, disconnects.
   - `market_order()` resolves when the matching `ORDER_FILLED` execution event arrives, keyed by `clientOrderId`.
 - `ctrader_broker.py`: `CTraderBroker`.

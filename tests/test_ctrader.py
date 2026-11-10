@@ -1,15 +1,18 @@
 """cTrader client and broker adapter, exercised with real protobuf messages and a fake transport."""
+import json
 from datetime import datetime, timezone
 
 import pytest
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthRes,
+    ProtoOAAccountsTokenInvalidatedEvent,
     ProtoOAApplicationAuthRes,
     ProtoOAErrorRes,
     ProtoOAExecutionEvent,
     ProtoOAGetAccountListByAccessTokenRes,
     ProtoOAReconcileRes,
+    ProtoOARefreshTokenRes,
     ProtoOATraderRes,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
@@ -21,8 +24,9 @@ from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
     ProtoOATradeData,
     ProtoOATrendbar,
 )
-from twisted.internet import defer
+from twisted.internet import defer, task
 
+from config import TokenStore
 from ctrader import CTraderClient
 from ctrader_broker import CTraderBroker, decode_trendbar, relative_price, spec_from_proto, to_volume
 from trading.broker import OrderRequest
@@ -37,17 +41,31 @@ def wrap(payload, client_msg_id=None) -> ProtoMessage:
 class FakeTransport:
     """Stands in for ctrader_open_api.Client: records requests, lets the test answer them."""
 
+    running = True
+
     def __init__(self):
         self.sent = []
+        self.restarts = 0
 
     def send(self, message, responseTimeoutInSeconds=5, **_):
         d = defer.Deferred()
         self.sent.append((message, d))
         return d
 
+    def stopService(self):
+        self.restarts += 1
 
-def make_client(live=False, account_id=123) -> tuple[CTraderClient, FakeTransport]:
-    client = CTraderClient("id", "secret", "token", account_id, live)
+    def startService(self):
+        pass
+
+
+def make_client(live=False, account_id=123, tokens="token", ready=True) -> tuple[CTraderClient, FakeTransport]:
+    """A client wired to a fake transport; ``ready`` pretends the login has already happened."""
+    client = CTraderClient("id", "secret", tokens, account_id, live, on_fatal=lambda reason: fatal.append(reason))
+    fatal: list[str] = []
+    client.fatal = fatal
+    client.ready = ready
+    client.clock = task.Clock()
     transport = FakeTransport()
     client.client = transport
     return client, transport
@@ -69,7 +87,7 @@ def authenticate(client, transport, responses):
 
 
 def test_auth_picks_demo_account_and_detects_view_only_scope():
-    client, transport = make_client(account_id=None)
+    client, transport = make_client(account_id=None, ready=False)
     ready = []
     client.on_ready(ready.append)
     authenticate(client, transport, [ProtoOAApplicationAuthRes(), account_list(scope=0),
@@ -82,10 +100,123 @@ def test_auth_picks_demo_account_and_detects_view_only_scope():
 
 
 def test_auth_rejects_an_account_the_token_does_not_cover():
-    client, transport = make_client(account_id=50)  # 50 is a live account; this client is on the demo host
+    client, transport = make_client(account_id=50, ready=False)  # 50 is a live account; this client is on the demo host
     failures = []
     authenticate(client, transport, [ProtoOAApplicationAuthRes(), account_list(scope=1)]).addErrback(failures.append)
     assert failures[0].value.code == "NO_ACCOUNT" and client.can_trade is True
+
+
+def failures_of(d):
+    out = []
+    d.addErrback(out.append)
+    return out
+
+
+def test_requests_fail_at_once_while_logged_out():
+    client, transport = make_client(ready=False)
+    assert failures_of(client.trader())[0].value.code == "NOT_READY"
+    assert failures_of(client.market_order(symbol_id=1, buy=True, volume=100, relative_stop_loss=10))[0].value.code \
+        == "NOT_READY"
+    assert transport.sent == []  # nothing queued to go out ahead of the next login
+
+
+def test_disconnect_fails_unanswered_requests_and_stale_logins_do_not_restart():
+    client, transport = make_client()
+    pending = failures_of(client.trader())
+    client._on_connected(None)  # a reconnect starts a login on the new connection
+    assert len(transport.sent) == 2
+    client._on_disconnected(None, "connection lost")
+    # Both fail now, not after the 30 s timeout, and the dead login does not schedule a restart.
+    assert pending[0].value.code == "DISCONNECTED"
+    assert client.clock.getDelayedCalls() == [] and client.fatal == [] and not client.ready
+    # The next connection logs in afresh.
+    client._on_connected(None)
+    assert len(transport.sent) == 3 and transport.restarts == 0
+
+
+def test_failed_login_reconnects_unless_already_reconnected():
+    client, transport = make_client(ready=False)
+    client._on_connected(None)
+    transport.sent[0][1].errback(defer.TimeoutError(30, "Deferred"))
+    client.clock.advance(10)
+    assert transport.restarts == 1 and client.fatal == []
+
+    client._on_connected(None)
+    transport.sent[1][1].errback(defer.TimeoutError(30, "Deferred"))
+    client._on_disconnected(None, "closed")  # the library reconnected meanwhile
+    client.clock.advance(10)
+    assert transport.restarts == 1
+
+
+def test_failed_start_up_callback_reconnects_to_retry_it():
+    client, transport = make_client(account_id=49, ready=False)
+    client.on_ready(lambda c: defer.fail(defer.TimeoutError(30, "Deferred")))
+    authenticate(client, transport, [ProtoOAApplicationAuthRes(), account_list(scope=1),
+                                     ProtoOAAccountAuthRes(ctidTraderAccountId=49)])
+    client.clock.advance(10)
+    assert transport.restarts == 1
+
+
+def expired():
+    return ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID", description="Access token expired")
+
+
+def test_expired_access_token_is_renewed_and_saved(tmp_path):
+    path = tmp_path / "token.json"
+    client, transport = make_client(account_id=49, ready=False, tokens=TokenStore("old", "refresh-1", path))
+    authenticate(client, transport, [
+        ProtoOAApplicationAuthRes(), expired(),
+        ProtoOARefreshTokenRes(accessToken="new", tokenType="bearer", expiresIn=2_628_000, refreshToken="refresh-2"),
+        account_list(scope=1), ProtoOAAccountAuthRes(ctidTraderAccountId=49),
+    ])
+    sent = [m for m, _ in transport.sent]
+    assert sent[2].refreshToken == "refresh-1"
+    assert sent[3].accessToken == "new" and sent[4].accessToken == "new"
+    assert client.ready and client.fatal == []
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text())["refresh_token"] == "refresh-2"
+    restarted = TokenStore("old", "refresh-1", path)  # the next run, with the same .env
+    assert (restarted.access_token, restarted.refresh_token) == ("new", "refresh-2")
+    assert restarted.expires_at is not None
+    replaced = TokenStore("pasted-later", "refresh-x", path)  # a new token in .env wins over the saved one
+    assert (replaced.access_token, replaced.refresh_token) == ("pasted-later", "refresh-x")
+
+
+def test_token_renewed_by_another_run_is_picked_up(tmp_path):
+    path = tmp_path / "token.json"
+    tokens = TokenStore("old", "refresh-1", path)
+    TokenStore("old", "refresh-1", path).save("new", "refresh-2", 3600)  # e.g. `fetch` renewed it meanwhile
+    client, transport = make_client(account_id=49, ready=False, tokens=tokens)
+    authenticate(client, transport, [ProtoOAApplicationAuthRes(), expired(), account_list(scope=1),
+                                     ProtoOAAccountAuthRes(ctidTraderAccountId=49)])
+    assert transport.sent[2][0].accessToken == "new" and client.ready  # no refresh request was needed
+
+
+def test_expired_token_stops_the_bot_without_a_refresh_token():
+    client, transport = make_client(ready=False)
+    client._on_connected(None)
+    for response in (ProtoOAApplicationAuthRes(), expired()):
+        transport.sent[-1][1].callback(wrap(response))
+    (reason,) = client.fatal
+    assert "CTRADER_REFRESH_TOKEN" in reason and len(transport.sent) == 2
+
+
+def test_rejected_refresh_token_stops_the_bot():
+    client, transport = make_client(ready=False, tokens=TokenStore("old", "used-up"))
+    client._on_connected(None)
+    for response in (ProtoOAApplicationAuthRes(), expired(), ProtoOAErrorRes(errorCode="ACCESS_DENIED")):
+        transport.sent[-1][1].callback(wrap(response))
+    (reason,) = client.fatal
+    assert "TOKEN_REFRESH_FAILED" in reason
+
+
+def test_invalidated_token_logs_in_again_instead_of_stopping():
+    client, transport = make_client()
+    client._on_message(None, wrap(ProtoOAAccountsTokenInvalidatedEvent(ctidTraderAccountIds=[999], reason="other")))
+    assert transport.restarts == 0  # another account
+    client._on_message(None, wrap(ProtoOAAccountsTokenInvalidatedEvent(ctidTraderAccountIds=[123], reason="expired")))
+    assert transport.restarts == 1 and client.fatal == [] and not client.ready
 
 
 def test_decode_trendbar_and_unit_conversions():

@@ -27,6 +27,18 @@ class OrderRequest:
     comment: str = ""
 
 
+@dataclass(frozen=True)
+class ClosedTrade:
+    """How a position ended, from the broker's deal history. Money is in the account currency."""
+
+    exit_price: float  # volume-weighted over the closing deals
+    exit_time: datetime  # time of the last closing deal
+    gross: float  # profit from the price move, spread included
+    swap: float
+    commission: float  # opening and closing commission together
+    net: float  # gross + swap + commission + any currency conversion fee
+
+
 class Broker(Protocol):
     def symbol_spec(self, symbol: str) -> SymbolSpec:
         """Contract details for a symbol loaded at start-up."""
@@ -49,3 +61,6 @@ class Broker(Protocol):
     def close_position(self, position: Position) -> Awaitable[None]: ...
 
     def amend_stop(self, position: Position, stop_loss: float) -> Awaitable[None]: ...
+
+    def closed_trade(self, position: Position) -> Awaitable[ClosedTrade | None]:
+        """The result of a position that is no longer open, or None if the broker has no closing deal for it."""

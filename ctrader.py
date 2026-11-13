@@ -17,6 +17,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAssetListReq,
     ProtoOAClientDisconnectEvent,
     ProtoOAClosePositionReq,
+    ProtoOADealListByPositionIdReq,
     ProtoOAErrorRes,
     ProtoOAExecutionEvent,
     ProtoOAGetAccountListByAccessTokenReq,
@@ -97,7 +98,8 @@ class CTraderClient:
     When the server rejects the access token as expired, the login renews it
     with the refresh token and saves the new pair in the ``TokenStore``.
 
-    Order-related methods refuse to run when connected to the live host.
+    Order-related methods refuse to run when connected to the live host,
+    unless ``allow_live_orders`` is set.
     """
 
     def __init__(
@@ -109,12 +111,14 @@ class CTraderClient:
         live: bool,
         on_spot: Callable[[int, float | None, float | None], None] | None = None,
         on_fatal: Callable[[str], None] | None = None,
+        allow_live_orders: bool = False,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.tokens = tokens if isinstance(tokens, TokenStore) else TokenStore(tokens)
         self.account_id = account_id
         self.live = live
+        self.allow_live_orders = allow_live_orders
         self.on_spot = on_spot
         self.on_fatal = on_fatal
         self.ready = False
@@ -408,15 +412,20 @@ class CTraderClient:
     def unrealized_pnl(self) -> defer.Deferred:
         return self._account_request(ProtoOAGetPositionUnrealizedPnLReq)
 
+    def position_deals(self, position_id: int, from_ms: int, to_ms: int) -> defer.Deferred:
+        """ProtoOADeal list of one position, executed between the two times. ``to_ms`` must not be in the future."""
+        return self._account_request(ProtoOADealListByPositionIdReq, positionId=position_id,
+                                     fromTimestamp=from_ms, toTimestamp=to_ms).addCallback(lambda r: list(r.deal))
+
     def subscribe_spots(self, symbol_ids: Iterable[int]) -> defer.Deferred:
         return self._account_request(ProtoOASubscribeSpotsReq, symbolId=list(symbol_ids))
 
-    # -- trading (demo accounts only) ---------------------------------------
+    # -- trading (demo accounts; live only with allow_live_orders) ----------
 
     def _trading_blocked(self) -> defer.Deferred | None:
-        if self.live:
+        if self.live and not self.allow_live_orders:
             return defer.fail(
-                CTraderError("LIVE_TRADING_DISABLED", "this bot only sends orders to demo accounts (CTRADER_LIVE=0)")
+                CTraderError("LIVE_TRADING_DISABLED", "orders to live accounts need allow_live_orders (trade --allow-live)")
             )
         if self.can_trade is False:
             return defer.fail(

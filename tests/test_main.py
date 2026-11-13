@@ -44,3 +44,21 @@ def test_bar_window_is_a_view():
     assert list(w) == [3, 4, 5, 6, 7] and list(reversed(w)) == [7, 6, 5, 4, 3]
     with pytest.raises(IndexError):
         w[5]
+
+
+def test_live_trading_needs_both_ctrader_live_and_allow_live():
+    main.check_live_trading(False, False)
+    main.check_live_trading(True, True)
+    with pytest.raises(SystemExit):
+        main.check_live_trading(True, False)
+    with pytest.raises(SystemExit):
+        main.check_live_trading(False, True)
+
+
+def test_live_and_demo_keep_separate_state_files():
+    args = main.build_parser().parse_args(["trade", "--strategy", "carry"])
+    assert not args.allow_live
+    assert [str(p) for p in main.trade_paths(args, False)] == ["state/live_state.json", "logs/journal.jsonl"]
+    assert [str(p) for p in main.trade_paths(args, True)] == ["state/real_state.json", "logs/real_journal.jsonl"]
+    args = main.build_parser().parse_args(["trade", "--strategy", "carry", "--state", "s.json", "--journal", "j.jsonl"])
+    assert [str(p) for p in main.trade_paths(args, True)] == ["s.json", "j.jsonl"]

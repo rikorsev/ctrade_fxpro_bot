@@ -4,8 +4,9 @@ from datetime import timedelta
 import pytest
 
 from tests.helpers import MONDAY, Scripted, daily_bars
-from trading.live import LiveConfig, LiveTrader
-from trading.models import FLAT, LONG, SHORT, AccountState, Position, Signal, SymbolSpec
+from trading.broker import ClosedTrade
+from trading.live import REPORT_ATTEMPTS, LiveConfig, LiveTrader
+from trading.models import FLAT, LONG, SHORT, AccountState, Bar, Position, Signal, SymbolSpec
 from trading.risk import RiskConfig, RiskManager
 
 
@@ -25,6 +26,7 @@ class FakeBroker:
         self.open_positions: list[Position] = []
         self.opened, self.closed, self.amended = [], [], []
         self.fail_open = False
+        self.results: dict[int, ClosedTrade] = {}  # what closed_trade reports, by position id
 
     def symbol_spec(self, symbol):
         return SymbolSpec.infer(symbol)
@@ -60,6 +62,9 @@ class FakeBroker:
 
     async def amend_stop(self, position, stop_loss):
         self.amended.append((position.position_id, stop_loss))
+
+    async def closed_trade(self, position):
+        return self.results.get(position.position_id)
 
 
 BARS = daily_bars([1.10, 1.11, 1.12, 1.13, 1.14])  # Mon..Fri of the first week
@@ -239,3 +244,79 @@ def test_intraday_tick_on_five_minute_bars(tmp_path):
     (order,) = broker.opened
     assert order.direction == LONG and order.strategy == "noise_breakout"
     assert [e["event"] for e in journal(tmp_path)] == ["signal", "opened"]
+
+
+def test_a_bar_that_closed_too_long_ago_is_not_acted_on(tmp_path):
+    start = MONDAY + timedelta(hours=14)
+    bars = [Bar(start + timedelta(minutes=5 * i), 1.1, 1.1, 1.1, 1.1) for i in range(6)]  # last closes 14:30
+    broker = FakeBroker({"EURUSD": bars})
+    s = Scripted({b.time: Signal(LONG, stop_distance=0.01) for b in bars}, lookback=3)
+    config = LiveConfig(symbols=("EURUSD",), timeframe="M5", execute=True,
+                        state_path=tmp_path / "state.json", journal_path=tmp_path / "journal.jsonl")
+    clock = {"now": bars[-1].time + timedelta(hours=2)}  # restarted two hours after the market stopped
+    t = LiveTrader(broker, [s], RiskManager(), config, clock=lambda: clock["now"])
+    assert not run(t.tick())
+    assert s.calls == [] and broker.opened == []
+    (event,) = journal(tmp_path)
+    assert (event["event"], event["symbol"], event["minutes_old"]) == ("stale_bar", "EURUSD", 115)
+    # Journaled once, also across a restart.
+    t._next_check.clear()
+    assert not run(t.tick())
+    assert not run(LiveTrader(broker, [s], RiskManager(), config, clock=lambda: clock["now"]).tick())
+    assert len(journal(tmp_path)) == 1
+    # The next bar that closes is traded as usual.
+    bars.append(Bar(bars[-1].time + timedelta(hours=2), 1.1, 1.1, 1.1, 1.1))
+    s.signals[bars[-1].time] = Signal(LONG, stop_distance=0.01)
+    clock["now"] = bars[-1].time + timedelta(minutes=5, seconds=20)
+    t._next_check.clear()
+    assert run(t.tick())
+    assert len(broker.opened) == 1
+
+
+class ClosesGbp(Scripted):
+    def on_bar(self, symbol, bars, position, context):
+        super().on_bar(symbol, bars, position, context)
+        return Signal(FLAT, reason="exit rule") if symbol == "GBPUSD" else None
+
+
+def test_closed_positions_are_journaled_with_the_brokers_result(tmp_path):
+    monday = daily_bars([1.14, 1.15], start=BARS[-1].time + timedelta(days=3))[1:]
+    broker = FakeBroker({"EURUSD": BARS, "GBPUSD": BARS})
+    stopped = Position("EURUSD", "scripted", LONG, 10_000, 1.10, MONDAY, stop_loss=1.09, position_id=1)
+    exited = Position("GBPUSD", "scripted", LONG, 10_000, 1.10, MONDAY, stop_loss=1.09, position_id=2)
+    broker.open_positions += [stopped, exited]
+    config = LiveConfig(symbols=("EURUSD", "GBPUSD"), timeframe="D1", execute=True,
+                        state_path=tmp_path / "state.json", journal_path=tmp_path / "journal.jsonl")
+    s = ClosesGbp({}, lookback=3)
+    friday = LiveTrader(broker, [s], RiskManager(), config, clock=lambda: BARS[-1].time + timedelta(days=1, minutes=1))
+    assert run(friday.tick())
+    assert broker.closed == [exited]
+    assert "trade_result" not in [e["event"] for e in journal(tmp_path)]  # reported once it is gone
+
+    # Over the weekend the EURUSD stop is hit. A restarted bot still knows both positions.
+    broker.open_positions.remove(stopped)
+    exit_time = BARS[-1].time + timedelta(days=1)
+    broker.results = {1: ClosedTrade(1.09, exit_time, -100.0, -0.5, -0.7, -101.2),
+                      2: ClosedTrade(1.141, exit_time, 410.0, 0.0, -0.7, 409.3)}
+    broker.data = {"EURUSD": BARS + monday, "GBPUSD": BARS + monday}
+    tuesday = LiveTrader(broker, [s], RiskManager(), config, clock=lambda: monday[-1].time + timedelta(days=1, minutes=1))
+    assert run(tuesday.tick())
+    results = {e["symbol"]: e for e in journal(tmp_path) if e["event"] == "trade_result"}
+    assert (results["EURUSD"]["closed_by"], results["EURUSD"]["net"], results["EURUSD"]["exit_price"]) == \
+        ("broker", -101.2, 1.09)
+    assert (results["GBPUSD"]["closed_by"], results["GBPUSD"]["reason"], results["GBPUSD"]["net"]) == \
+        ("strategy", "exit rule", 409.3)
+    assert tuesday._tracked == {}
+
+
+def test_a_closed_position_without_deals_is_journaled_after_a_few_cycles(tmp_path):
+    broker = FakeBroker({"EURUSD": BARS})
+    t = trader(tmp_path, broker, Scripted({}, lookback=3))
+    t._tracked[9] = Position("EURUSD", "scripted", SHORT, 10_000, 1.10, MONDAY, stop_loss=1.11, position_id=9)
+    for _ in range(REPORT_ATTEMPTS - 1):
+        run(t._report_closed([]))
+    assert not (tmp_path / "journal.jsonl").exists()
+    run(t._report_closed([]))
+    (event,) = journal(tmp_path)
+    assert event["event"] == "trade_result" and event["position_id"] == 9 and "net" not in event
+    assert event["error"] == "the broker has no closing deal for it" and t._tracked == {}

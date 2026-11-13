@@ -125,7 +125,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
 
 def cmd_trade(args: argparse.Namespace) -> None:
-    """Run strategies against the demo account (dry run unless --execute)."""
+    """Run strategies on the account (dry run unless --execute). Live accounts need --allow-live."""
     from twisted.internet import defer, task
 
     from ctrader import CTraderClient
@@ -135,14 +135,14 @@ def cmd_trade(args: argparse.Namespace) -> None:
     from trading.risk import RiskManager
 
     config = load_config()
-    if config.live:
-        sys.exit("Refusing to run: CTRADER_LIVE=1. This bot only trades demo accounts.")
+    check_live_trading(config.live, args.allow_live)
+    state_path, journal_path = trade_paths(args, config.live)
     symbols = _symbols(args)
     timeframe = resolve_timeframe(args.timeframe, args.strategy)
     strategies = build_strategies(args.strategy, args.param, timeframe)
     risk = RiskManager(risk_config(args))
     client = CTraderClient(config.client_id, config.client_secret, config.tokens(), config.account_id,
-                           config.live, on_fatal=_stop_reactor)
+                           config.live, on_fatal=_stop_reactor, allow_live_orders=config.live and args.allow_live)
     broker = CTraderBroker(client, label_prefix=args.label)
     intraday = timeframe_delta(timeframe) < timedelta(hours=1)
     live_config = LiveConfig(
@@ -150,16 +150,19 @@ def cmd_trade(args: argparse.Namespace) -> None:
         timeframe=timeframe,
         execute=args.execute,
         settle=timedelta(seconds=3 if intraday else 15),
-        state_path=Path(args.state),
-        journal_path=Path(args.journal),
+        state_path=state_path,
+        journal_path=journal_path,
     )
     trader = LiveTrader(broker, strategies, risk, live_config)
     if args.reset_drawdown:
         risk.reset_drawdown()
         log.warning("Drawdown halt cleared; the peak equity restarts from the next equity reading")
 
-    log.info("Mode: %s on demo account. Strategies: %s. Symbols: %s. Timeframe: %s.",
-             "EXECUTE" if args.execute else "DRY RUN (no orders)", ", ".join(s.describe() for s in strategies),
+    if config.live:
+        log.warning("LIVE ACCOUNT: %s", "orders use real money" if args.execute else "dry run, no orders are sent")
+    log.info("Mode: %s on %s account. Strategies: %s. Symbols: %s. Timeframe: %s.",
+             "EXECUTE" if args.execute else "DRY RUN (no orders)", "LIVE" if config.live else "demo",
+             ", ".join(s.describe() for s in strategies),
              ", ".join(trader.symbols), timeframe)
     log.info("Risk: %s", risk.config)
 
@@ -189,6 +192,22 @@ def cmd_trade(args: argparse.Namespace) -> None:
     client.on_ready(on_ready)
     client.start()
     _run_reactor()
+
+
+def check_live_trading(live: bool, allow_live: bool) -> None:
+    """Exit unless the account kind (CTRADER_LIVE) and the --allow-live flag agree."""
+    if live and not allow_live:
+        sys.exit("Refusing to run: CTRADER_LIVE=1 selects a real-money account. "
+                 "Add --allow-live to trade it, or set CTRADER_LIVE=0 for demo.")
+    if allow_live and not live:
+        sys.exit("--allow-live needs CTRADER_LIVE=1; without it the bot connects to the demo host.")
+
+
+def trade_paths(args: argparse.Namespace, live: bool) -> tuple[Path, Path]:
+    """State and journal files. Live and demo keep separate defaults so their risk state never mixes."""
+    state = args.state or ("state/real_state.json" if live else "state/live_state.json")
+    journal = args.journal or ("logs/real_journal.jsonl" if live else "logs/journal.jsonl")
+    return Path(state), Path(journal)
 
 
 _FAILURES: list[str] = []
@@ -465,16 +484,20 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_args(sweep)
     sweep.set_defaults(handler=cmd_sweep)
 
-    trade = sub.add_parser("trade", help="run strategies on the demo account (dry run unless --execute)")
+    trade = sub.add_parser("trade", help="run strategies on the account (dry run unless --execute)")
     strategy_args(trade)
     data_args(trade)
     risk_args(trade)
-    trade.add_argument("--execute", action="store_true", help="send orders (demo accounts only)")
+    trade.add_argument("--execute", action="store_true", help="send orders")
+    trade.add_argument("--allow-live", action="store_true",
+                       help="required with CTRADER_LIVE=1: run on a real-money account")
     trade.add_argument("--poll", type=float,
                        help="seconds between checks for new bars (default: 5 for M1-M30, 60 otherwise)")
     trade.add_argument("--label", default="fxbot", help="position label prefix used to recognise bot trades")
-    trade.add_argument("--state", default="state/live_state.json", help="risk and progress state file")
-    trade.add_argument("--journal", default="logs/journal.jsonl", help="JSON-lines decision/order journal")
+    trade.add_argument("--state", help="risk and progress state file "
+                                        "(default: state/live_state.json on demo, state/real_state.json on live)")
+    trade.add_argument("--journal", help="JSON-lines decision/order journal "
+                                          "(default: logs/journal.jsonl on demo, logs/real_journal.jsonl on live)")
     trade.add_argument("--reset-drawdown", action="store_true", help="clear a max-drawdown halt")
     trade.add_argument("-v", "--verbose", action="store_true")
     trade.set_defaults(handler=cmd_trade)

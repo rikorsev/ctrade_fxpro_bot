@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATradeSide
 from twisted.internet import defer
 
 from ctrader import CTraderClient, CTraderError
-from trading.broker import OrderRequest
+from trading.broker import ClosedTrade, OrderRequest
 from trading.costs import BrokerSwaps, CurrencyConverter, SwapCarry
 from trading.models import LONG, SHORT, AccountState, Bar, Position, SymbolSpec, timeframe_delta
 
@@ -19,6 +20,7 @@ PRICE_SCALE = 100_000  # cTrader sends prices as integers in 1/100000 units
 VOLUME_SCALE = 100  # and volumes in hundredths of a unit
 MAX_BARS_PER_REQUEST = 5_000  # the server caps responses at 14,000 bars; stay well below
 RATE_CACHE = timedelta(minutes=10)
+DEAL_SEARCH_MARGIN = timedelta(seconds=5)  # a deal search must end in the past, by the server's clock
 SWAP_TYPES = {0: "pips", 1: "percent", 2: "points"}
 BUY = ProtoOATradeSide.Value("BUY")
 
@@ -241,7 +243,12 @@ class CTraderBroker:
             label=f"{self.label_prefix}:{order.strategy}",
             comment=order.comment,
         )
-        return self._to_position(event.position, spec.name, order.strategy)
+        position = self._to_position(event.position, spec.name, order.strategy)
+        if position.stop_loss is None:
+            # The fill event comes before the server attaches the relative stop; report the stop the order set.
+            distance = relative_price(order.stop_distance, spec.digits) / PRICE_SCALE
+            position = replace(position, stop_loss=spec.round_price(position.entry_price - position.direction * distance))
+        return position
 
     def close_position(self, position: Position) -> defer.Deferred:
         return self.client.close_position(position.position_id, to_volume(position.units))
@@ -250,3 +257,43 @@ class CTraderBroker:
         spec = self.symbol_spec(position.symbol)
         take_profit = spec.round_price(position.take_profit) if position.take_profit else None
         return self.client.amend_position_sltp(position.position_id, spec.round_price(stop_loss), take_profit)
+
+    # -- history --------------------------------------------------------------
+
+    def closed_trade(self, position: Position) -> defer.Deferred:
+        return defer.ensureDeferred(self._closed_trade(position))
+
+    async def _closed_trade(self, position: Position) -> ClosedTrade | None:
+        """Sum the position's closing deals, from just before its entry until a few seconds ago."""
+        # The server rejects a search that ends in the future (INCORRECT_BOUNDARIES), so stay clear of
+        # clock differences. A deal from the last few seconds is picked up on the next try.
+        end = datetime.now(timezone.utc) - DEAL_SEARCH_MARGIN
+        deals = await self.client.position_deals(position.position_id, _ms(position.entry_time - timedelta(minutes=1)),
+                                                 _ms(end))
+        closing = sorted((d for d in deals if d.HasField("closePositionDetail")), key=lambda d: d.executionTimestamp)
+        if not closing:
+            return None
+
+        def money(deal, field: str) -> float:
+            detail = deal.closePositionDetail
+            digits = detail.moneyDigits if detail.HasField("moneyDigits") else (
+                deal.moneyDigits if deal.HasField("moneyDigits") else self._money_digits)
+            return getattr(detail, field) / 10 ** digits
+
+        volumes = [d.closePositionDetail.closedVolume or d.filledVolume for d in closing]
+        gross = sum(money(d, "grossProfit") for d in closing)
+        swap = sum(money(d, "swap") for d in closing)
+        commission = sum(money(d, "commission") for d in closing)
+        fees = sum(money(d, "pnlConversionFee") for d in closing)
+        return ClosedTrade(
+            exit_price=sum(d.executionPrice * v for d, v in zip(closing, volumes)) / sum(volumes),
+            exit_time=datetime.fromtimestamp(closing[-1].executionTimestamp / 1000, timezone.utc),
+            gross=round(gross, 2),
+            swap=round(swap, 2),
+            commission=round(commission, 2),
+            net=round(gross + swap + commission + fees, 2),
+        )
+
+
+def _ms(t: datetime) -> int:
+    return int(t.timestamp() * 1000)

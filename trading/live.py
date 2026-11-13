@@ -8,6 +8,11 @@ logs every decision and sends nothing.
 Decisions, orders and errors are appended to a JSON-lines journal, and the
 last processed bar plus the risk manager's kill-switch state are saved after
 every cycle, so a restart neither repeats a bar nor forgets a halt.
+
+A bar that closed too long ago (after a restart, or on a market that has
+stopped trading) is journaled as ``stale_bar`` and not acted on. When a
+position the bot knew about is gone, whoever closed it, its result from the
+broker's deal history is journaled as ``trade_result``.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -31,10 +36,21 @@ log = logging.getLogger(__name__)
 
 FIRST_RETRY = timedelta(minutes=1)
 MAX_RETRY = timedelta(hours=1)
+REPORT_ATTEMPTS = 3  # cycles to wait for a closed position's deals before journaling it without a result
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def default_max_bar_age(bar_length: timedelta) -> timedelta:
+    """How long after its close a bar may still be acted on.
+
+    An intraday decision is out of date once the next bar has closed. A daily
+    or weekly signal fills at the next open, which can be a weekend and a
+    holiday away.
+    """
+    return bar_length if bar_length < timedelta(days=1) else bar_length + timedelta(days=3)
 
 
 @dataclass(frozen=True)
@@ -43,6 +59,7 @@ class LiveConfig:
     timeframe: str = "D1"
     execute: bool = False
     settle: timedelta = timedelta(seconds=15)  # wait after a bar closes before asking for it
+    max_bar_age: timedelta | None = None  # skip bars that closed longer ago; None: default_max_bar_age
     state_path: Path | None = None
     journal_path: Path | None = None
 
@@ -67,11 +84,16 @@ class LiveTrader:
         self.config = config
         self.clock = clock
         self.bar_length = timeframe_delta(config.timeframe)
+        self.max_bar_age = config.max_bar_age or default_max_bar_age(self.bar_length)
         self.lookback = max(s.lookback for s in strategies)
         self.last_bar: dict[str, datetime] = {}
         self._next_check: dict[str, datetime] = {}
         self._retry: dict[str, timedelta] = {}
         self._busy = False
+        # Open positions as of the last cycle, by id, so that a position closed by its stop is noticed too.
+        self._tracked: dict[int, Position] = {}
+        self._closed_by_strategy: dict[int, str] = {}  # position id -> why the strategy closed it
+        self._report_attempts: dict[int, int] = {}
         # Which strategies run on each symbol. A symbol a strategy cannot trade is left out, not fatal.
         self._plan: dict[str, list[Strategy]] = {}
         for symbol in config.symbols:
@@ -111,6 +133,7 @@ class LiveTrader:
         try:
             now = self.clock()
             fresh = {}
+            stale: dict[str, Bar] = {}
             for symbol in self.symbols:
                 due = self._next_check.get(symbol)
                 if due is not None and now < due:
@@ -122,7 +145,10 @@ class LiveTrader:
                     bars, forming_close = [], None
                 last = self.last_bar.get(symbol)
                 if bars and (last is None or bars[-1].time > last):
-                    fresh[symbol] = bars
+                    if now - (bars[-1].time + self.bar_length) > self.max_bar_age:
+                        stale[symbol] = bars[-1]
+                    else:
+                        fresh[symbol] = bars
                 if symbol in fresh or (forming_close is not None and forming_close > now):
                     self._retry.pop(symbol, None)
                     upcoming = forming_close or bars[-1].time + 2 * self.bar_length
@@ -131,7 +157,16 @@ class LiveTrader:
                     delay = min(self._retry.get(symbol, FIRST_RETRY / 2) * 2, MAX_RETRY)
                     self._retry[symbol] = delay
                     self._next_check[symbol] = now + delay
+            for symbol, bar in stale.items():
+                # Too late to trade on: the decision belonged to a moment that has passed. Mark it done.
+                minutes = round((now - bar.time - self.bar_length).total_seconds() / 60)
+                log.info("%s: newest bar %s closed %d minutes ago; not acting on it", symbol,
+                         f"{bar.time:%Y-%m-%d %H:%M}", minutes)
+                self._journal("stale_bar", symbol=symbol, bar=bar.time, minutes_old=minutes)
+                self.last_bar[symbol] = bar.time
             if not fresh:
+                if stale:
+                    self._save_state()
                 return False
             try:
                 await self._cycle(fresh, now)
@@ -159,6 +194,7 @@ class LiveTrader:
     async def _cycle(self, fresh: dict[str, list[Bar]], now: datetime) -> None:
         account = await self.broker.account()
         positions = await self.broker.positions()
+        open_at_start = list(positions)
         halt = self.risk.update(account.equity, now)
         if halt:
             log.warning("Risk halt: %s", halt)
@@ -208,6 +244,7 @@ class LiveTrader:
             await self._close(close)
         for update in updates:
             await self._amend(update)
+        opened_now: list[Position] = []
         if entries:
             if closes and self.config.execute:
                 account = await self.broker.account()
@@ -219,7 +256,17 @@ class LiveTrader:
                 opened = await self._enter(intent, account, positions, prices)
                 if opened is not None:
                     positions.append(opened)
+                    opened_now.append(opened)
 
+        # After the orders, so that looking up results never delays them. A failure here must not fail the
+        # cycle: that would retry this bar, whose orders have already gone out.
+        try:
+            await self._report_closed(open_at_start)
+        except Exception:
+            log.exception("Could not report closed positions; trying again next cycle")
+        for p in (*open_at_start, *opened_now):
+            if p.position_id is not None:
+                self._tracked[p.position_id] = p
         self.last_bar.update({s: b[-1].time for s, b in fresh.items()})
         self._save_state()
 
@@ -308,6 +355,42 @@ class LiveTrader:
             return
         log.info("Closed %s %s position %s (%s)", side_name(p.direction), p.symbol, p.position_id, action.reason)
         self._journal("closed", **details)
+        if p.position_id is not None:
+            self._closed_by_strategy[p.position_id] = action.reason
+
+    async def _report_closed(self, open_now: Sequence[Position]) -> None:
+        """Journal the broker's result for every tracked position that is no longer open."""
+        still_open = {p.position_id for p in open_now}
+        for position_id, p in list(self._tracked.items()):
+            if position_id in still_open:
+                self._report_attempts.pop(position_id, None)
+                continue
+            attempts = self._report_attempts.get(position_id, 0) + 1
+            try:
+                trade = await self.broker.closed_trade(p)
+                error = None if trade is not None else "the broker has no closing deal for it"
+            except Exception as exc:
+                trade, error = None, str(exc) or type(exc).__name__
+            if trade is None and attempts < REPORT_ATTEMPTS:
+                log.info("%s position %s is gone but its result is not available yet (%s); trying again next cycle",
+                         p.symbol, position_id, error)
+                self._report_attempts[position_id] = attempts
+                continue
+            del self._tracked[position_id]
+            self._report_attempts.pop(position_id, None)
+            reason = self._closed_by_strategy.pop(position_id, None)
+            details = dict(strategy=p.strategy, symbol=p.symbol, side=side_name(p.direction), units=p.units,
+                           position_id=position_id, entry_price=p.entry_price, entry_time=p.entry_time,
+                           stop_loss=p.stop_loss, closed_by="strategy" if reason else "broker",
+                           reason=reason or "stop loss, take profit, stop-out or manual close")
+            if trade is None:
+                log.warning("%s position %s closed; result unknown: %s", p.symbol, position_id, error)
+                self._journal("trade_result", error=error, **details)
+                continue
+            log.info("%s %s position %s closed at %g by the %s: net %+.2f", side_name(p.direction), p.symbol,
+                     position_id, trade.exit_price, details["closed_by"], trade.net)
+            self._journal("trade_result", exit_price=trade.exit_price, exit_time=trade.exit_time, gross=trade.gross,
+                          swap=trade.swap, commission=trade.commission, net=trade.net, **details)
 
     async def _amend(self, action: StopUpdate) -> None:
         p = action.position
@@ -349,6 +432,8 @@ class LiveTrader:
         state = json.loads(path.read_text())
         self.last_bar = {s: datetime.fromisoformat(t) for s, t in state.get("last_bar", {}).items()}
         self.risk.restore(state.get("risk", {}))
+        self._tracked = {int(k): _position_from_json(v) for k, v in state.get("positions", {}).items()}
+        self._closed_by_strategy = {int(k): v for k, v in state.get("closed_by_strategy", {}).items()}
         log.info("Restored state from %s (last bars: %s)", path, ", ".join(
             f"{s} {t:%Y-%m-%d %H:%M}" for s, t in sorted(self.last_bar.items())) or "none")
 
@@ -357,7 +442,13 @@ class LiveTrader:
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        state = {"last_bar": {s: t.isoformat() for s, t in self.last_bar.items()}, "risk": self.risk.state()}
+        state = {
+            "last_bar": {s: t.isoformat() for s, t in self.last_bar.items()},
+            "risk": self.risk.state(),
+            # Positions open at the last cycle: a restart still reports those closed while the bot was down.
+            "positions": {str(k): _position_to_json(p) for k, p in self._tracked.items()},
+            "closed_by_strategy": {str(k): v for k, v in self._closed_by_strategy.items()},
+        }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(state, indent=2))
         os.replace(tmp, path)
@@ -371,3 +462,11 @@ class LiveTrader:
                   "mode": "execute" if self.config.execute else "dry-run", **fields}
         with open(path, "a") as f:
             f.write(json.dumps(record, default=str) + "\n")
+
+
+def _position_to_json(p: Position) -> dict[str, Any]:
+    return {**asdict(p), "entry_time": p.entry_time.isoformat()}
+
+
+def _position_from_json(data: dict[str, Any]) -> Position:
+    return Position(**{**data, "entry_time": datetime.fromisoformat(data["entry_time"])})

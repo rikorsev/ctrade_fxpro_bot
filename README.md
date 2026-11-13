@@ -6,7 +6,7 @@ Linux/Python bot for an FxPro cTrader account. It can:
 - backtest evidence-based strategies with realistic costs, swaps and risk limits:
   - **day trading** on five-minute bars of index CFDs, flat before every close (`noise_breakout`, `orb`);
   - swing trading on daily bars of FX pairs (`donchian`, `tsmom`, `carry`);
-- run the same strategies against a **demo** account, as a dry run or sending orders, with a `standard` or an `aggressive` risk profile.
+- run the same strategies against a **demo** account (or, with an explicit opt-in, a live one), as a dry run or sending orders, with a `standard` or an `aggressive` risk profile.
 
 > **Read [docs/RESEARCH.md](docs/RESEARCH.md) before trading anything.** The research reviews the academic evidence and tests every strategy net of FxPro's costs:
 > - **Day trading.** Of 24 intraday strategy and market combinations tested on 2011–2026 five-minute data, only `noise_breakout` (intraday momentum) on the Nasdaq 100 CFD made money after costs: 5% a year at 1% risk per trade, Sharpe 0.40, 24% maximum drawdown. Its edge is small: +1.4 basis points per trade, not statistically reliable, and indistinguishable from luck once picking the best of 24 is accounted for. It breaks even at twice the modelled costs, and it has roughly broken even since the paper behind it appeared in May 2024.
@@ -14,11 +14,11 @@ Linux/Python bot for an FxPro cTrader account. It can:
 >
 > Use the bot on demo as an experiment, not as a source of income.
 
-Order sending is **demo-only**. The `trade` command refuses to start with `CTRADER_LIVE=1`, and the client rejects order requests on the live host.
+Order sending is **demo by default**. With `CTRADER_LIVE=1` the `trade` command refuses to start unless you also pass `--allow-live`, and the client rejects order requests on the live host unless it was started that way. See [Trade on a live account](#trade-on-a-live-account).
 
 ## 1. Create a cTrader account
 
-You need an FxPro cTrader account. Use a demo account: the bot only trades demo.
+You need an FxPro cTrader account. Start with a demo account; live trading needs an explicit opt-in.
 
 ## 2. Register a cTrader Open API application
 
@@ -67,9 +67,9 @@ FxPro names its index CFDs with a leading `#` (`#USNDAQ100`, `#USSPX500`, `#Germ
 | `CTRADER_ACCOUNT_ID` | no | first demo account for the token | cTID trader account ID |
 | `CTRADER_SYMBOL` | no | `EURUSD` | Symbol for the quote stream (case-insensitive) |
 | `CTRADER_SYMBOLS` | no | `CTRADER_SYMBOL` | Comma-separated default symbols for `fetch`, `backtest`, `sweep` and `trade` |
-| `CTRADER_LIVE` | no | `0` | `1` connects to the live host (quotes and data only; trading refuses to run) |
+| `CTRADER_LIVE` | no | `0` | `1` connects to the live host (quotes and data; `trade` also needs `--allow-live`) |
 
-Keep `CTRADER_LIVE=0`.
+Keep `CTRADER_LIVE=0` unless you mean to use a real-money account.
 
 ## 5. Run
 
@@ -124,6 +124,10 @@ python main.py trade --strategy carry --execute                                 
 
 Every entry is a market order with a broker-side stop. Decisions, orders and errors go to `logs/journal.jsonl`.
 
+Every closed position gets a `trade_result` line with its exit price, gross profit, swap, commission and net result in the account currency, taken from the broker's deal history. That includes positions closed by their stop. `closed_by` says whether the strategy or the broker closed it. The line is written at the first cycle after the position is gone, usually within one bar.
+
+The bot does not act on a bar that closed too long ago: more than one bar ago on intraday timeframes, or more than one bar plus three days on daily bars. This happens after a restart or on a market that has stopped trading, such as an expired futures contract. Such a bar is journaled as `stale_bar`, and the bot waits for the next one.
+
 A symbol that cannot be traded does not stop the others. The bot logs a warning, journals `symbol_ignored` and carries on with the rest when a symbol is not offered on the account or a strategy has no trading session for it. It exits only if no symbol is left. If a strategy raises an error on one symbol, that bar is skipped and journaled as `strategy_failed`.
 
 **Day trading.** With an intraday strategy the bot works on five-minute bars:
@@ -143,6 +147,23 @@ Its other behaviour:
 - Progress and kill-switch state are kept in `state/live_state.json`, so a restart neither repeats a bar nor forgets a halt.
 - The bot only manages positions labelled `fxbot:<strategy>`; manual trades on the account are left alone.
 - If a drawdown halt fires, clear it with `--reset-drawdown` once you have decided to continue.
+
+### Trade on a live account
+
+The research above says to expect losses, so do this only with money you can afford to lose, and only after running the same setup on demo.
+
+1. Get an access token for the live account issued with the `trading` scope. The token in `.env` must have access to that account.
+2. Set `CTRADER_LIVE=1` in `.env`, and `CTRADER_ACCOUNT_ID` to the live account's cTID trader account ID (empty picks the token's first live account).
+3. Run a dry run first, then add `--execute`:
+
+```bash
+python main.py trade --strategy noise_breakout --symbols '#USNDAQ100' --allow-live             # dry run on the live account
+python main.py trade --strategy noise_breakout --symbols '#USNDAQ100' --allow-live --execute   # real orders
+```
+
+- `--allow-live` is required whenever `CTRADER_LIVE=1`, and refused when it is not.
+- Live runs keep their own state and journal (`state/real_state.json`, `logs/real_journal.jsonl`), so demo equity never feeds the live drawdown switch.
+- The default `standard` risk profile (0.5% per trade) is the sensible choice here.
 
 ## Strategies
 
@@ -212,7 +233,7 @@ The tests cover indicators, sessions and daylight saving, daily and intraday str
 ```text
 main.py              CLI: quotes (default), fetch, backtest, sweep, trade
 config.py            reads and validates environment variables
-ctrader.py           CTraderClient: connection, auth, typed Deferred-based requests, demo-only order methods
+ctrader.py           CTraderClient: connection, auth, typed Deferred-based requests, order methods (demo unless allowed)
 ctrader_broker.py    CTraderBroker: implements trading.broker.Broker on top of CTraderClient
 trading/
   models.py          Bar, BarWindow, SymbolSpec (with approximate CFD specs), Position, Signal, AccountState

@@ -287,7 +287,7 @@ Every limit is shared by the backtester and the live trader (`trading/risk.py`).
 | Max positions | 10 | 6 | |
 | Daily loss halt | 3% from the previous day's equity; no new entries until the next UTC day | 6% | |
 | Drawdown halt | 20% from peak; no new entries until a human runs `trade --reset-drawdown` | 50% | At 0.5% risk, 20% would have stopped donchian in March 2011 and tsmom in October 2012. At 2% risk the best intraday backtest fell 51% (2014 to 2017), so a lower threshold would halt on routine losses. Even 50% fired, in May 2017 (§11). |
-| Demo only | `trade` exits if `CTRADER_LIVE=1`; the client refuses order requests on the live host | Required by this project. |
+| Demo by default | `trade` exits if `CTRADER_LIVE=1` without `--allow-live`; the client refuses order requests on the live host unless started that way | A real-money account needs a deliberate opt-in. |
 | Only own positions | Bot positions carry the label `fxbot:<strategy>`; anything else on the account is ignored | Manual trades are never touched. |
 
 ---

@@ -4,15 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Python bot for an FxPro account via the Spotware cTrader Open API. It streams quotes, downloads history, backtests strategies and runs them against a **demo** account. It has two families of strategies: intraday (day trading on five-minute bars, flat before each session closes) and daily (swing trading on D1 bars).
+Python bot for an FxPro account via the Spotware cTrader Open API. It streams quotes, downloads history, backtests strategies and runs them against a **demo** account (a live account only with an explicit opt-in). It has two families of strategies: intraday (day trading on five-minute bars, flat before each session closes) and daily (swing trading on D1 bars).
 
-Order sending is **demo-only by design**, enforced in two places:
-- `main.py trade` exits when `CTRADER_LIVE=1`;
-- `CTraderClient` refuses `market_order`, `close_position` and `amend_position_sltp` on the live host.
+Order sending is **demo by default**. Live trading needs `CTRADER_LIVE=1` *and* `trade --allow-live` (the user asked for this opt-in), enforced in two places:
+- `main.py trade` exits when `CTRADER_LIVE=1` without `--allow-live`, or `--allow-live` without `CTRADER_LIVE=1` (`check_live_trading`);
+- `CTraderClient` refuses `market_order`, `close_position` and `amend_position_sltp` on the live host unless built with `allow_live_orders=True`, which only `main.py trade --allow-live` does.
+
+Live runs default to their own state and journal files (`trade_paths`: `state/real_state.json`, `logs/real_journal.jsonl`) so demo risk state never mixes with the real account.
 
 The client also refuses orders when the access token's `permissionScope` is view-only, and `trade --execute` then exits with status 1. Orders need a token issued with the `trading` scope.
 
-Keep both guards. Don't add a live-trading path unless the user explicitly asks.
+Keep both guards and keep the opt-in explicit. Don't make live trading a default or add other ways around the guards.
 
 `docs/RESEARCH.md` is the research report behind the strategies. Part I (daily) concludes that none of the daily strategies has a reliable edge on FX majors at retail costs today. Part II (intraday) finds a real but small intraday momentum effect that survives FxPro's costs only with `noise_breakout` on the Nasdaq 100 CFD. That net result is not statistically reliable and has been weak since the paper was published. Keep the code, README and report consistent with that. Don't present strategies as profitable.
 
@@ -72,8 +74,10 @@ The layering is strategy → planner/risk → broker interface → cTrader clien
   - Positions still open at the end are closed so they appear in the trade list.
 - `live.LiveTrader`: `tick()` is an `async` method.
   - It fetches bars only when a new bar should have closed, drops the forming bar, and merges D1 weekend stubs.
+  - A new bar that closed more than `max_bar_age` ago is journaled as `stale_bar` and not acted on (`default_max_bar_age`: one bar for intraday timeframes; for D1 and longer, one bar plus three days, so a weekend does not count). This covers restarts and markets that have stopped trading, such as expired futures.
   - It runs strategies, then executes closes, then stop updates, then entries (sized with fresh equity).
-  - It journals to JSON lines and saves `last_bar` and risk state after each cycle. Bars where a strategy returns `None` (no opinion) are logged at DEBUG and not journaled.
+  - It tracks the bot's open positions by id. When one is gone, whoever closed it, the end of the cycle journals `trade_result` with the realized P&L from `Broker.closed_trade`, and `closed_by` set to `strategy` or `broker` (stop, take profit, stop-out or manual close). If no closing deal turns up after `REPORT_ATTEMPTS` cycles, it journals the trade with an `error` instead.
+  - It journals to JSON lines and saves `last_bar`, risk state and the tracked positions after each cycle. Bars where a strategy returns `None` (no opinion) are logged at DEBUG and not journaled.
   - One bad symbol never stops the others. Symbols a strategy cannot trade (`check_symbol`) are dropped at construction, and `ignore()` drops those the account does not offer (`CTraderBroker.load` returns them). Both are journaled as `symbol_ignored`. An exception from `on_bar` or the planner skips that strategy/symbol for the bar (`strategy_failed`). A failed bar fetch backs off per symbol. Only account-level failures retry the whole cycle.
   - Without `execute` it is a dry run.
 - `broker.Broker`: the protocol `LiveTrader` uses. Methods return awaitables; `CTraderBroker` returns Deferreds.
@@ -93,6 +97,8 @@ The layering is strategy → planner/risk → broker interface → cTrader clien
   - Converts units, prices and stops (cTrader volumes are hundredths of a unit; prices and relative SL/TP are in 1/100000).
   - Builds `SymbolSpec` from `ProtoOASymbol`, fetches history in chunks below the 14,000-bar cap, and computes currency conversion rates.
   - Only reports positions labelled `<prefix>:<strategy>`.
+  - The fill event arrives before the server attaches the relative stop, so `open_position` fills in the stop the order set.
+  - `closed_trade` sums a position's closing deals (`ProtoOAClosePositionDetail`). The server rejects a deal search that ends in the future (`INCORRECT_BOUNDARIES`), so the search stops a few seconds before now.
 
 To add a new API interaction, add a typed method to `CTraderClient` that sends the request with `self._account_request(...)` (or `self.request(...)`) and decodes the response in a callback. If the strategy layer needs it, expose it through `CTraderBroker` and the `Broker` protocol.
 

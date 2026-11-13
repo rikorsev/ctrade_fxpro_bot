@@ -1,6 +1,6 @@
 """cTrader client and broker adapter, exercised with real protobuf messages and a fake transport."""
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
@@ -16,7 +16,9 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOATraderRes,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+    ProtoOAClosePositionDetail,
     ProtoOACtidTraderAccount,
+    ProtoOADeal,
     ProtoOALightSymbol,
     ProtoOAOrder,
     ProtoOAPosition,
@@ -30,7 +32,7 @@ from config import TokenStore
 from ctrader import CTraderClient
 from ctrader_broker import CTraderBroker, decode_trendbar, relative_price, spec_from_proto, to_volume
 from trading.broker import OrderRequest
-from trading.models import LONG, SHORT
+from trading.models import LONG, SHORT, Position
 
 
 def wrap(payload, client_msg_id=None) -> ProtoMessage:
@@ -59,9 +61,11 @@ class FakeTransport:
         pass
 
 
-def make_client(live=False, account_id=123, tokens="token", ready=True) -> tuple[CTraderClient, FakeTransport]:
+def make_client(live=False, account_id=123, tokens="token", ready=True,
+                allow_live_orders=False) -> tuple[CTraderClient, FakeTransport]:
     """A client wired to a fake transport; ``ready`` pretends the login has already happened."""
-    client = CTraderClient("id", "secret", tokens, account_id, live, on_fatal=lambda reason: fatal.append(reason))
+    client = CTraderClient("id", "secret", tokens, account_id, live, on_fatal=lambda reason: fatal.append(reason),
+                           allow_live_orders=allow_live_orders)
     fatal: list[str] = []
     client.fatal = fatal
     client.ready = ready
@@ -275,15 +279,25 @@ def test_live_client_refuses_to_trade():
     assert transport.sent == []
 
 
+def test_live_client_trades_when_allowed():
+    client, transport = make_client(live=True, allow_live_orders=True)
+    failures = []
+    client.market_order(symbol_id=1, buy=True, volume=100_000, relative_stop_loss=100).addErrback(failures.append)
+    client.close_position(1, 100).addErrback(failures.append)
+    assert failures == []
+    assert len(transport.sent) == 2
+
+
 def trade_data(label="fxbot:donchian", side=1, volume=5_000_000):
     return ProtoOATradeData(symbolId=1, volume=volume, tradeSide=side, openTimestamp=1_700_000_000_000, label=label)
 
 
-def execution(client_order_id, execution_type=3):
+def execution(client_order_id, execution_type=3, stop_loss=1.0902):
     order = ProtoOAOrder(orderId=9, tradeData=trade_data(), orderType=1, orderStatus=2,
                          clientOrderId=client_order_id)
-    position = ProtoOAPosition(positionId=55, tradeData=trade_data(), positionStatus=1, swap=0,
-                               price=1.1002, stopLoss=1.0902)
+    position = ProtoOAPosition(positionId=55, tradeData=trade_data(), positionStatus=1, swap=0, price=1.1002)
+    if stop_loss is not None:
+        position.stopLoss = stop_loss
     return ProtoOAExecutionEvent(ctidTraderAccountId=123, executionType=execution_type, order=order,
                                  position=position)
 
@@ -320,6 +334,9 @@ class FakeClient:
     def __init__(self, reconcile=None):
         self._reconcile = reconcile
         self.orders = []
+        self.fill_stop = 1.0902  # stop on the fill event; None: the event comes before the stop is set
+        self.deals = []
+        self.deal_searches = []
 
     def reconcile(self):
         return defer.succeed(self._reconcile)
@@ -329,7 +346,11 @@ class FakeClient:
 
     def market_order(self, **kwargs):
         self.orders.append(kwargs)
-        return defer.succeed(execution("x"))
+        return defer.succeed(execution("x", stop_loss=self.fill_stop))
+
+    def position_deals(self, position_id, from_ms, to_ms):
+        self.deal_searches.append((position_id, from_ms, to_ms))
+        return defer.succeed([d for d in self.deals if from_ms <= d.executionTimestamp <= to_ms])
 
 
 def broker_with(reconcile=None) -> CTraderBroker:
@@ -363,3 +384,70 @@ def test_open_position_converts_units_and_stops():
     assert order["volume"] == 5_000_000 and order["relative_stop_loss"] == 1230 and order["buy"]
     assert order["label"] == "fxbot:donchian"
     assert out[0].position_id == 55 and out[0].entry_price == 1.1002
+    assert out[0].stop_loss == 1.0902
+
+
+def eurusd_broker() -> CTraderBroker:
+    broker = broker_with()
+    broker._specs["EURUSD"] = spec_from_proto(ProtoOASymbol(symbolId=1, digits=5, pipPosition=4),
+                                              broker._light["EURUSD"], broker._assets)
+    return broker
+
+
+def test_open_position_reports_the_ordered_stop_when_the_fill_event_has_none():
+    broker = eurusd_broker()
+    broker.client.fill_stop = None
+    out = []
+    broker.open_position(OrderRequest("EURUSD", "donchian", LONG, 50_000, 0.0123)).addCallback(out.append)
+    assert out[0].stop_loss == pytest.approx(1.1002 - 0.0123)
+
+
+def deal(deal_id, side, price, when, volume=5_000_000, gross=None):
+    d = ProtoOADeal(dealId=deal_id, orderId=deal_id, positionId=55, volume=volume, filledVolume=volume, symbolId=1,
+                    createTimestamp=when, executionTimestamp=when, executionPrice=price, tradeSide=side,
+                    dealStatus=2, moneyDigits=2)
+    if gross is not None:  # a closing deal; money in cents
+        d.closePositionDetail.CopyFrom(ProtoOAClosePositionDetail(
+            entryPrice=1.1002, grossProfit=gross, swap=-30, commission=-120, balance=0, closedVolume=volume,
+            moneyDigits=2, pnlConversionFee=-5))
+    return d
+
+
+def test_closed_trade_sums_the_closing_deals():
+    broker = eurusd_broker()
+    now = datetime.now(timezone.utc)
+    entry = now - timedelta(days=10)
+    position = Position("EURUSD", "carry", LONG, 50_000, 1.1002, entry, stop_loss=1.09, position_id=55)
+    ms = lambda t: int(t.timestamp() * 1000)  # noqa: E731
+    broker.client.deals = [
+        deal(1, 1, 1.1002, ms(entry)),  # the opening deal
+        deal(2, 2, 1.0950, ms(now - timedelta(hours=2)), volume=3_000_000, gross=-1_560),
+        deal(3, 2, 1.0900, ms(now - timedelta(hours=1)), volume=2_000_000, gross=-2_040),
+    ]
+    out = []
+    broker.closed_trade(position).addCallback(out.append)
+    trade = out[0]
+    assert trade.exit_price == pytest.approx((1.0950 * 3 + 1.0900 * 2) / 5)
+    assert trade.exit_time == datetime.fromtimestamp(ms(now - timedelta(hours=1)) / 1000, timezone.utc)
+    assert (trade.gross, trade.swap, trade.commission, trade.net) == (-36.0, -0.6, -2.4, -39.1)
+    (position_id, frm, to), = broker.client.deal_searches
+    assert position_id == 55 and frm < ms(entry)
+    assert to < ms(datetime.now(timezone.utc))  # the server rejects a search that ends in the future
+
+    broker.client.deals = broker.client.deals[:1]  # still open, or closed without a deal yet
+    out = []
+    broker.closed_trade(position).addCallback(out.append)
+    assert out == [None]
+
+
+def test_position_deals_request_and_response():
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOADealListByPositionIdRes
+
+    client, transport = make_client()
+    out = []
+    client.position_deals(55, 1_000, 2_000).addCallback(out.append)
+    (request, pending), = transport.sent
+    assert (request.ctidTraderAccountId, request.positionId, request.fromTimestamp, request.toTimestamp) == \
+        (123, 55, 1_000, 2_000)
+    pending.callback(wrap(ProtoOADealListByPositionIdRes(ctidTraderAccountId=123, deal=[deal(7, 2, 1.09, 1_500, gross=-10)])))
+    assert [d.dealId for d in out[0]] == [7]
